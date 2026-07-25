@@ -26,12 +26,18 @@ void main() {
     float a00=0,a01=0,a10=0,a11=0;
 
     for (uint k = 0; k < pc.K; k += 32) {
+        // Fused: input is W1W3 output [M][2*K] = gate||up, first K = gate, second K = up
+        // At[m][k] = silu(gate[m][k]) * up[m][k] — computed inline, no separate SiLU pass
         for (uint r = 0; r < 2; r++) for (uint c = 0; c < 8; c++) {
             uint mr = tx*2+r, mc = ty*8+c;
             if (m0+r < pc.M && k+mc < pc.K) {
-                uint64_t a = pc.input_offset + ((m0+r)*pc.K + k + mc) * 2;
-                uint w = data[uint(a>>2)];
-                At[mr][mc] = f16_to_f32((w>>(uint(a&3)*8))&0xFFFF);
+                uint64_t row_gate = pc.input_offset + (((m0+r)*pc.K*2u) + k + mc) * 2u;
+                uint wg = data[uint(row_gate>>2u)];
+                float gate = f16_to_f32((wg>>(uint(row_gate&3u)*8u))&0xFFFF);
+                uint64_t row_up = row_gate + uint64_t(pc.K) * 2u;
+                uint wu = data[uint(row_up>>2u)];
+                float up_v = f16_to_f32((wu>>(uint(row_up&3u)*8u))&0xFFFF);
+                At[mr][mc] = silu(gate) * up_v;
             } else At[mr][mc] = 0;
         }
         barrier();

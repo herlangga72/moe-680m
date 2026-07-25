@@ -37,33 +37,28 @@ void main() {
     uint64_t q_base = pc.input_offset;
     uint64_t state_base = pc.weights_offset + uint64_t(pc.layer_idx) * 16 * 32 * 128 * 128 * 4;
 
-    // Locate this head pair's data in QKV output:
+    // Locate this head pair's data in QKV output (u16/f16 stride 2):
     // Q[16×128] at offset 0
-    // K[16×128] at offset 16×128×4
-    // V[32×128] at offset 32×128×4
-    // G[32]     at offset 64×128×4  (wait, Q+K+V = 16+16+32 = 64 heads × 128 = 8192 f32 total)
+    // K[16×128] at offset 16×128×2
+    // V[32×128] at offset 32×128×2
+    // G[32]     at offset 64×128×2
 
-    // Q: 16 QK heads × 128 dim × 4B = 8192 bytes = at offset 0 + qkh*128*4
-    // K: 16 QK heads × 128 dim × 4B = 8192 bytes = at offset 8192 + qkh*128*4
-    // V: 32 V heads × 128 dim × 4B = 16384 bytes = at offset 16384 + vh*128*4
-    // G: 32 V heads × 4B = 128 bytes = at offset 32768 + vh*4
+    uint64_t q_off = q_base + qkh * 128 * 2 + row * 2;
+    uint64_t k_off = q_base + 16*128*2 + qkh * 128 * 2 + row * 2;
+    uint64_t v_off = q_base + 32*128*2 + vh * 128 * 2 + row * 2;
 
-    uint64_t q_off = q_base + qkh * 128 * 4 + row * 4;
-    uint64_t k_off = q_base + 16*128*4 + qkh * 128 * 4 + row * 4;
-    uint64_t v_off = q_base + 32*128*4 + vh * 128 * 4 + row * 4;
-
-    // Read q[row], k[row] for this thread
-    uint64_t kq = k_off; // same offset structure
-    float k_val = uintBitsToFloat(data[uint(k_off>>2)]);
-    float q_val = uintBitsToFloat(data[uint(q_off>>2)]);
+    // Read q[row], k[row] for this thread (f16 input from GEMM)
+    uint64_t kq = k_off;
+    float k_val = f16_to_f32(read_u16(k_off));
+    float q_val = f16_to_f32(read_u16(q_off));
 
     // Cooperative: thread row loads V[row]
-    sv[row] = uintBitsToFloat(data[uint(v_off>>2)]);
+    sv[row] = f16_to_f32(read_u16(v_off));
     barrier(); // all v values loaded
 
     // Read gate for this V head
-    uint64_t g_off = q_base + 64*128*4 + vh * 4;
-    float gate = uintBitsToFloat(data[uint(g_off>>2)]);
+    uint64_t g_off = q_base + 64*128*2 + vh * 2;
+    float gate = f16_to_f32(read_u16(g_off));
     float one_minus_gate = 1.0 - gate;
 
     // State base for this head pair: [qkh][vh] = layer * 16*32*128*128 + qkh*32*128*128 + vh*128*128
@@ -99,8 +94,8 @@ void main() {
         // Need q[j] for all j — this requires all q values
         // We only have q[row] locally. Need shared q array.
         // Simplified: read from global again
-        uint64_t qj_off = q_base + qkh * 128 * 4 + j * 4;
-        float qj = uintBitsToFloat(data[uint(qj_off>>2)]);
+        uint64_t qj_off = q_base + qkh * 128 * 2 + j * 2;
+        float qj = f16_to_f32(read_u16(qj_off));
         o_val += s_val * qj;
     }
 

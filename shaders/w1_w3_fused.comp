@@ -63,7 +63,7 @@ void main() {
         uint mi = m0+r, ni = n0+c;
         if (mi >= pc.M || ni >= pc.N) continue;
         float v = r==0?(c==0?a00:a01):(c==0?a10:a11);
-        if (ni < hn) v = silu(v);
+        // ponytail: no SiLU here — silu_mult applies it after
         uint f16 = f32_to_f16(v);
         uint64_t oa = pc.output_offset + (mi*pc.N+ni)*2;
         uint wi = uint(oa>>2), sh = uint(oa&3)*8;
