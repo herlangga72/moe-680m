@@ -248,9 +248,14 @@ fn run_inference(model_path: &str, prompt_text: Option<&str>, max_tokens: u32,
 
     // 9. Init engine
     eprintln!("Initializing engine...");
+    let dev_for_cleanup = dc.device.clone(); // handle for error cleanup (dc consumed by new())
     let mut engine = match inference::InferenceEngine::new(dc, pipelines, layout, weights, arena_ptr) {
         Ok(e) => e,
-        Err(err) => { eprintln!("❌ Engine: {}", err); return; }
+        Err(err) => {
+            eprintln!("❌ Engine: {}", err);
+            unsafe { dev_for_cleanup.destroy_buffer(arena_buffer, None); dev_for_cleanup.free_memory(arena_mem, None); }
+            return;
+        }
     };
 
     // 10. Server mode
@@ -266,7 +271,7 @@ fn run_inference(model_path: &str, prompt_text: Option<&str>, max_tokens: u32,
         #[cfg(not(feature = "server"))]
         {
             eprintln!("Server not enabled. Build with: cargo build --features server");
-            unsafe { engine.device.device.free_memory(arena_mem, None); }
+            unsafe { engine.device.device.destroy_buffer(arena_buffer, None); engine.device.device.free_memory(arena_mem, None); }
             return;
         }
     }
@@ -306,6 +311,6 @@ fn run_inference(model_path: &str, prompt_text: Option<&str>, max_tokens: u32,
         }
         eprintln!("\n✅ Generated {} tokens", output_ids.len());
 
-        unsafe { engine.device.device.free_memory(arena_mem, None); }
+        unsafe { engine.device.device.destroy_buffer(arena_buffer, None); engine.device.device.free_memory(arena_mem, None); }
     }
 }
