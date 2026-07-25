@@ -356,7 +356,10 @@ fn chat_loop(tokenizer: &tokenizer::Tokenizer, engine: &mut inference::Inference
         // Build full conversation with chat template
         conversation.push_str(&format!("\n<|im_start|>user\n{}\n<|im_end|>\n<|im_start|>assistant\n", input));
 
-        let input_ids = tokenizer.encode(&conversation);
+        let mut input_ids = tokenizer.encode(&conversation);
+        if input_ids.first() != Some(&tokenizer.bos_id) {
+            input_ids.insert(0, tokenizer.bos_id);
+        }
         let mut output_ids = Vec::new();
         let mut decoded = String::new();
         engine.reset_sampling();

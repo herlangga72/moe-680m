@@ -66,15 +66,23 @@ fn read_key() -> Key {
     if io::stdin().read(&mut buf).ok() != Some(1) { return Key::Esc; }
     match buf[0] {
         0x1B => {
-            // Check for escape sequence with 50ms timeout
             let mut fds = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
             let r = unsafe { libc::poll(&mut fds, 1, 50) };
             if r > 0 {
                 let mut seq = [0u8; 2];
                 if io::stdin().read(&mut seq[..1]).ok() == Some(1) && seq[0] == b'[' {
                     if io::stdin().read(&mut seq[1..2]).ok() == Some(1) {
-                        return match seq[1] { b'A' => Key::Up, b'B' => Key::Down, _ => Key::Esc };
+                        match seq[1] {
+                            b'A' => return Key::Up, b'B' => return Key::Down, _ => {}
+                        }
                     }
+                }
+                // Consume remaining escape sequence bytes (50ms timeout each)
+                loop {
+                    let mut fds2 = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+                    if unsafe { libc::poll(&mut fds2, 1, 50) } <= 0 { break; }
+                    let mut junk = [0u8; 1];
+                    if io::stdin().read(&mut junk).ok() != Some(1) { break; }
                 }
             }
             Key::Esc
@@ -97,14 +105,18 @@ const FIELDS: &[Field] = &[
 
 // ── Edit a field value interactively ──
 
-fn edit_field(label: &str, current: &str) -> String {
-    // restore cooked mode to read a line
-    println!("\x1B[K"); // clear status line
-    print!("  {}: ", label);
+fn edit_field(label: &str, current: &str, orig: &termios) -> String {
+    unsafe { tcsetattr(STDIN_FILENO, TCSANOW, orig); } // restore cooked mode for edit
+    print!("\x1B[K  {}: ", label);
     io::stdout().flush().ok();
     let mut s = String::new();
     io::stdin().read_line(&mut s).ok();
     let trimmed = s.trim().to_string();
+    let mut raw = *orig;
+    raw.c_lflag &= !(ICANON | ECHO);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    unsafe { tcsetattr(STDIN_FILENO, TCSANOW, &raw); } // re-enter raw mode
     if trimmed.is_empty() { current.to_string() } else { trimmed }
 }
 
@@ -211,24 +223,24 @@ pub fn run() -> Option<Config> {
             Key::Enter => {
                 match FIELDS[sel] {
                     Field::Model => {
-                        let s = edit_field("Model path", cfg.model_path.as_deref().unwrap_or(""));
+                        let s = edit_field("Model path", cfg.model_path.as_deref().unwrap_or(""), &orig);
                         if !s.is_empty() && Path::new(&s).exists() { cfg.model_path = Some(s); }
                         else if !s.is_empty() { eprintln!("\n  Not found: {}", s); }
                     }
                     Field::Prompt => {
-                        let s = edit_field("Prompt text", &cfg.prompt);
+                        let s = edit_field("Prompt text", &cfg.prompt, &orig);
                         cfg.prompt = s;
                     }
                     Field::Temperature => {
-                        let s = edit_field("Temperature", &format!("{:.1}", cfg.temperature));
+                        let s = edit_field("Temperature", &format!("{:.1}", cfg.temperature), &orig);
                         cfg.temperature = s.parse().unwrap_or(cfg.temperature);
                     }
                     Field::TopK => {
-                        let s = edit_field("Top-K", &cfg.top_k.to_string());
+                        let s = edit_field("Top-K", &cfg.top_k.to_string(), &orig);
                         cfg.top_k = s.parse().unwrap_or(cfg.top_k);
                     }
                     Field::MaxTokens => {
-                        let s = edit_field("Max tokens", &cfg.max_tokens.to_string());
+                        let s = edit_field("Max tokens", &cfg.max_tokens.to_string(), &orig);
                         cfg.max_tokens = s.parse().unwrap_or(cfg.max_tokens);
                     }
                     Field::Server => {
@@ -236,7 +248,7 @@ pub fn run() -> Option<Config> {
                         cfg.server_port = if !on { Some(cfg.server_port.unwrap_or(8080)) } else { None };
                     }
                     Field::Port => {
-                        let s = edit_field("Server port", &cfg.server_port.unwrap_or(8080).to_string());
+                        let s = edit_field("Server port", &cfg.server_port.unwrap_or(8080).to_string(), &orig);
                         cfg.server_port = Some(s.parse().unwrap_or(cfg.server_port.unwrap_or(8080)) as u16);
                     }
                     Field::Debug => { cfg.debug = !cfg.debug; }
@@ -253,7 +265,7 @@ pub fn run() -> Option<Config> {
                     continue;
                 }
                 if cfg.prompt.is_empty() {
-                    let s = edit_field("Prompt text", "");
+                    let s = edit_field("Prompt text", "", &orig);
                     print!("\x1B[2J\x1B[H");
                     cfg.prompt = s;
                     if cfg.prompt.is_empty() { continue; }
