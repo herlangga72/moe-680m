@@ -481,7 +481,63 @@ impl InferenceEngine {
         unsafe { dev.cmd_dispatch(cmd, M, 1, 1); }
         self.barrier(cmd);
 
-        if is_gqa {
+        let use_fused = M == 1
+            && self.pipelines.pipelines[PipelineType::FusedRmsNormQkvRope as usize] != vk::Pipeline::null()
+            && self.pipelines.pipelines[PipelineType::AttnResidual as usize] != vk::Pipeline::null();
+
+        if is_gqa && use_fused {
+            // ── Fused generation path: RMS norm + QKV GEMM + RoPE ──
+            self.bind_pipe(cmd, PipelineType::FusedRmsNormQkvRope);
+            let mut pc = PushConstants::default();
+            pc.input_offset = hi;
+            pc.weights_offset = self.weights.attn_q[layer as usize];
+            pc.output_offset = out_off;  // writes QKVRoPE to tmp + hidden*2
+            pc.M = 1; pc.N = 5120; pc.K = hidden;
+            pc.num_experts = s.seq_len;  // RoPE position
+            pc.routing_weights_off = self.weights.attn_k[layer as usize];
+            pc.num_qk_heads = 16; pc.num_v_heads = 2;
+            pc.token_ids_off = self.weights.attn_v[layer as usize];
+            self.push(cmd, &pc);
+            unsafe { dev.cmd_dispatch(cmd, 1, 640, 1); }
+            self.barrier(cmd);
+
+            // ── KV cache write ──
+            let gqa_idx = layer / 4;
+            let cache_layer = self.layout.kv_cache_base
+                + gqa_idx as u64 * self.layout.kv_cache_layer_stride;
+            self.bind_pipe(cmd, PipelineType::KvWrite);
+            pc = PushConstants::default();
+            pc.input_offset = out_off;  // Q+K+V buffer
+            pc.weights_offset = cache_layer;
+            pc.M = 1; pc.K = s.seq_len;
+            pc.N = self.weights.max_seq_len;
+            self.push(cmd, &pc);
+            unsafe { dev.cmd_dispatch(cmd, 1, 32, 1); }
+            self.barrier(cmd);
+
+            // ── GQA Attention ──
+            self.bind_pipe(cmd, PipelineType::GqaAttention);
+            pc = PushConstants::default();
+            pc.input_offset = out_off;  // Q start
+            pc.weights_offset = cache_layer;  // K/V cache
+            pc.output_offset = tmp;
+            pc.M = 1; pc.K = s.seq_len + 1;
+            self.push(cmd, &pc);
+            unsafe { dev.cmd_dispatch(cmd, 1, 16, 1); }
+            self.barrier(cmd);
+
+            // ── Fused attn_output GEMM + residual add ──
+            self.bind_pipe(cmd, PipelineType::AttnResidual);
+            pc = PushConstants::default();
+            pc.input_offset = tmp;               // attention output
+            pc.weights_offset = self.weights.attn_output[layer as usize];
+            pc.output_offset = ho;                // write to ho
+            pc.M = 1; pc.N = hidden; pc.K = hidden;
+            pc.routing_weights_off = hi;          // residual input
+            self.push(cmd, &pc);
+            unsafe { dev.cmd_dispatch(cmd, self.div64(1), self.div8(hidden), 1); }
+            self.barrier(cmd);
+        } else if is_gqa {
             // ── Q projection: hidden × attn_q → tmp (Q output) ──
             self.bind_pipe(cmd, PipelineType::GqaQkv);
             pc.input_offset = tmp;
@@ -586,7 +642,9 @@ impl InferenceEngine {
         self.barrier(cmd);
 
         // ── (M1) Residual Add: hi + out_off → ho ──
-        self.bind_pipe(cmd, PipelineType::ResidualAdd);
+        // Skiped for fused path (AttnResidual already adds residual)
+        if !(is_gqa && use_fused) {
+            self.bind_pipe(cmd, PipelineType::ResidualAdd);
         pc.input_offset = hi;       // original input (residual)
         pc.weights_offset = out_off; // GEMM output
         pc.output_offset = ho;      // write to output buffer (not hi!)
@@ -594,6 +652,7 @@ impl InferenceEngine {
         self.push(cmd, &pc);
         unsafe { dev.cmd_dispatch(cmd, M, self.div256(hidden), 1); }
         self.barrier(cmd);
+        }
 
         // ── Router: ho × router_weights → routing_logits ──
         self.bind_pipe(cmd, PipelineType::Router);

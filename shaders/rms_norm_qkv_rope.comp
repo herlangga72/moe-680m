@@ -1,0 +1,165 @@
+// ── rms_norm_qkv_rope: fused RMS norm + Q/K/V GEMM + RoPE ──
+// Single kernel eliminates 3 global round-trips per GQA layer.
+// Dispatch: (div64(M), div8(5120), 1) — M=1 only (generation).
+// LDS: norm_in[2048] f32 (8 KB) + red[128] f32 (0.5 KB) + Bt[32][8] f32 (1 KB) = ~9.5 KB
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset;     // hidden state (f16)
+    uint64_t weights_offset;   // Q weight matrix (IQ4_XS)
+    uint64_t output_offset;    // Q+K+V fused output (f16)
+    uint M; uint N; uint K; uint position;  // position = RoPE position
+    uint64_t k_weights_off;    // K weight matrix (IQ4_XS)
+    uint num_qk_heads; uint num_v_heads;
+    uint layer_idx; uint _pad1; uint64_t v_weights_off; // V weight matrix (IQ4_XS)
+    float scale_factor;
+} pc;
+
+#include "common.glsl"
+
+const uint Q_ELEMS = 4096;   // 16 heads x 256 dim
+const uint K_ELEMS = 512;    // 2 heads x 256 dim
+const uint V_ELEMS = 512;    // 2 heads x 256 dim
+const uint TOTAL_ELEMS = 5120;
+const uint HEAD_DIM = 256;
+const uint ROPE_PAIRS = 32;  // first 64 dims of each head
+
+shared float norm_in[2048];
+shared float red[128];
+shared float Bt[32][8];
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+void main() {
+    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;
+    uint tid = tx + ty * 32;
+    uint batch = gl_GlobalInvocationID.x;
+    uint oc = gl_GlobalInvocationID.y * 8;
+    uint m0 = batch * 64 + tx * 2, n0 = oc + ty * 2;
+
+    if (batch >= pc.M) return;
+
+    // ── Phase 1: RMS Norm ──
+    uint64_t base = pc.input_offset + uint64_t(batch) * uint64_t(pc.K) * 2;
+    float sum_sq = 0.0;
+    for (uint i = tid; i < pc.K; i += 128) {
+        uint64_t a = base + uint64_t(i) * 2;
+        uint w = data[uint(a >> 2)];
+        float v = f16_to_f32((w >> (uint(a & 3) * 8)) & 0xFFFF);
+        sum_sq += v * v;
+        norm_in[i] = v;
+    }
+    red[tid] = sum_sq;
+    barrier();
+    for (uint s = 64; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    float rms = sqrt(red[0] / float(pc.K) + 1e-6);
+    for (uint i = tid; i < pc.K; i += 128) {
+        norm_in[i] /= rms;
+    }
+    barrier();
+
+    // ── Phase 2: GEMM — which region? ──
+    // oc = gl_GlobalInvocationID.y * 8 determines column block
+    // Determine weight base and stride for this column block
+    uint64_t w_off;
+    uint n_stride;
+    uint col_base = 0;
+
+    if (oc < Q_ELEMS) {
+        w_off = pc.weights_offset;
+        n_stride = Q_ELEMS;
+        col_base = 0;
+    } else if (oc < Q_ELEMS + K_ELEMS) {
+        w_off = pc.k_weights_off;
+        n_stride = K_ELEMS;
+        col_base = Q_ELEMS;
+    } else {
+        w_off = pc.v_weights_off;
+        n_stride = V_ELEMS;
+        col_base = Q_ELEMS + K_ELEMS;
+    }
+
+    float a00=0,a01=0,a10=0,a11=0;
+
+    for (uint k = 0; k < pc.K; k += 32) {
+        // No At load — read directly from norm_in (already in LDS from phase 1)
+        // Load Bt from IQ4_XS weights
+        for (uint off = 0; off < 8; off += 4) {
+            uint nc = ty + off;
+            if (k + tx < pc.K && oc + nc < TOTAL_ELEMS) {
+                Bt[tx][nc] = dequant_iq4_xs(w_off, (k + tx) * n_stride + (oc + nc - col_base));
+            } else Bt[tx][nc] = 0;
+        }
+        barrier();
+
+        for (uint kk = 0; kk < 32; kk++) {
+            float a_norm = norm_in[k + kk];
+            float b0 = Bt[kk][ty * 2 + 0];
+            float b1 = Bt[kk][ty * 2 + 1];
+            a00 += a_norm * b0;
+            a01 += a_norm * b1;
+            // Row 1: same norm for M=1 (masked on write if out of bounds)
+            a10 += a_norm * b0;
+            a11 += a_norm * b1;
+        }
+        barrier();
+    }
+
+    // ── Phase 3: Write output with RoPE ──
+    for (uint r = 0; r < 2; r++) for (uint c = 0; c < 2; c++) {
+        uint mi = m0 + r, ni = n0 + c;
+        if (mi >= pc.M || ni >= TOTAL_ELEMS) continue;
+        float v = r == 0 ? (c == 0 ? a00 : a01) : (c == 0 ? a10 : a11);
+
+        // Apply RoPE to Q and K elements in first 64 dims of each head
+        if (ni < Q_ELEMS + K_ELEMS && (ni % HEAD_DIM) < 64) {
+            // Even columns are the first element of each RoPE pair
+            uint col = ni & ~1u; // align to pair start
+            if (c == 0) {
+                // We have the first element of the pair (a00 or a10 at n0+0=col)
+                // Write rotated values for both elements
+                uint head = col / HEAD_DIM;
+                uint pair = (col % HEAD_DIM) / 2;
+                float inv_freq = 1.0 / pow(10000.0, float(2 * pair) / 64.0);
+                float theta = float(pc.position) * inv_freq;
+                float cos_t = cos(theta);
+                float sin_t = sin(theta);
+
+                // Read pair from accumulated values
+                float v0 = v;
+                // Need v1 (second element of pair) — already in a01/a11
+                float v1 = r == 0 ? (c == 0 ? a01 : a00) : (c == 0 ? a11 : a10);
+                // For c=0: pair is (a00 at col, a01 at col+1). v1 = a01.
+                // For c=1: this branch only handles c==0
+
+                float r0 = v0 * cos_t - v1 * sin_t;
+                float r1 = v0 * sin_t + v1 * cos_t;
+
+                // Write r0 (this thread's element)
+                uint f16_0 = f32_to_f16(r0);
+                uint64_t oa0 = pc.output_offset + (uint64_t(mi) * TOTAL_ELEMS + col) * 2;
+                uint wi0 = uint(oa0 >> 2), sh0 = uint(oa0 & 3) * 8;
+                data[wi0] = (data[wi0] & ~(0xFFFFu << sh0)) | (f16_0 << sh0);
+
+                // Write r1 (pair element, might be this thread or another)
+                uint f16_1 = f32_to_f16(r1);
+                uint64_t oa1 = pc.output_offset + (uint64_t(mi) * TOTAL_ELEMS + col + 1) * 2;
+                uint wi1 = uint(oa1 >> 2), sh1 = uint(oa1 & 3) * 8;
+                data[wi1] = (data[wi1] & ~(0xFFFFu << sh1)) | (f16_1 << sh1);
+            }
+            // c == 1: pair was handled by c == 0 thread (same pair)
+        } else {
+            // V region or outside RoPE dims: write as-is
+            uint f16 = f32_to_f16(v);
+            uint64_t oa = pc.output_offset + (uint64_t(mi) * TOTAL_ELEMS + ni) * 2;
+            uint wi = uint(oa >> 2), sh = uint(oa & 3) * 8;
+            data[wi] = (data[wi] & ~(0xFFFFu << sh)) | (f16 << sh);
+        }
+    }
+}

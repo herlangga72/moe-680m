@@ -12,7 +12,7 @@ macro_rules! debug_log {
     };
 }
 
-pub const MAX_PIPELINES: usize = 20;
+pub const MAX_PIPELINES: usize = 22;
 
 /// Pipeline type enum — direct index into `pipelines[]`.
 #[repr(u32)]
@@ -35,6 +35,8 @@ pub enum PipelineType {
     ResidualAdd = 14,
     SiluMult = 15,
     Rope = 16,
+    FusedRmsNormQkvRope = 17,
+    AttnResidual = 18,
 }
 
 pub struct PipelineResources {
@@ -208,6 +210,8 @@ pub unsafe fn create_pipelines(
     try_pipeline!(PipelineType::ResidualAdd, "residual_add");
     try_pipeline!(PipelineType::SiluMult, "silu_mult");
     try_pipeline!(PipelineType::Rope, "rope");
+    try_pipeline!(PipelineType::FusedRmsNormQkvRope, "rms_norm_qkv_rope");
+    try_pipeline!(PipelineType::AttnResidual, "attn_residual");
 
     // Save pipeline cache
     if let Ok(data) = device.get_pipeline_cache_data(pipeline_cache) {
