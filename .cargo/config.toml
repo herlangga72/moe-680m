@@ -1,0 +1,3 @@
+[build]
+# rustc temp dir needs a writable location
+target-dir = "/home/server/llm/moe-680m/target"

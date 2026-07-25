@@ -1,0 +1,26 @@
+[package]
+name = "moe-680m"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ash = "0.38"
+memmap2 = "0.9"
+bytemuck = { version = "1.15", features = ["derive"] }
+libc = "0.2"
+# To enable Gigatoken, uncomment and build with --features gigatoken:
+#   git clone https://github.com/marcelroed/gigatoken /tmp/gigatoken
+#   cargo build --features gigatoken
+# gigatoken = { path = "/tmp/gigatoken", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = []
+# Uncomment the dep above AND enable this feature to use Gigatoken:
+gigatoken = []
+server = ["dep:serde", "dep:serde_json"]
+
+[profile.release]
+lto = true
+codegen-units = 1
