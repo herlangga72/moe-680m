@@ -52,14 +52,12 @@ impl ArenaLayout {
         let deltanet_state_base = off;
         off += deltanet_state_size;
 
-        // Snapshot for prefill MoE
-        off += align(cfg.context_length as u64 * cfg.embedding_length as u64 * 2);
-
         // MoE scratch + layer compute temp
         let scratch_base = off;
         off += align(cfg.context_length as u64 * cfg.feed_forward_length as u64 * 2);
 
         // Layer compute temp: max(hidden*3, 4128) per token × 2B, capped at 8192
+        // ponytail: 8192 cap saves ~3 GB vs full ctx. Overflow if prefill >8192. Upgrade: use ctx_len.
         let prefill_batch = (8192u64).min(cfg.context_length as u64);
         let temp_base = off;
         off += align(prefill_batch * (cfg.embedding_length * 3).max(4128) as u64 * 2);
@@ -68,8 +66,9 @@ impl ArenaLayout {
         let routing_logits_base = off;
         off += align(cfg.context_length as u64 * cfg.expert_count as u64 * 4);
 
-        // GPU topk results: seq_len × 72 bytes (9 entries × 8B each)
-        let routing_topk_size = align(cfg.context_length as u64 * 72);
+        // GPU topk results: 9 entries × 8B each (expert_id:u16 + weight:f32 packed)
+        // ponytail: only used for generation (M=1), needs 72 B total. Allocate 256 for alignment.
+        let routing_topk_size = 256u64;
         let routing_topk_base = off;
         off += routing_topk_size;
 
