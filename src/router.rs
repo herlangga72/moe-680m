@@ -33,10 +33,11 @@ fn route_single(logits: &[f32]) -> RoutingOutput {
         for p in &mut probs { *p *= inv; }
     }
 
-    // Top-8 selection (partial sort)
-    // Find indices of 8 highest probabilities
-    let mut indices: Vec<usize> = (0..logits.len().min(256)).collect();
-    indices.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+    // Top-8 selection (partial sort on stack array)
+    let n = logits.len().min(256);
+    let mut indices = [0usize; 256];
+    for i in 0..n { indices[i] = i; }
+    indices[..n].sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
 
     let mut routed = [0u16; 8];
     let mut weights = [0.0f32; 8];
@@ -94,10 +95,3 @@ pub fn build_expert_batches(
     (sorted_tokens, sorted_weights, ranges)
 }
 
-/// Sampling: greedy argmax over logits.
-pub fn argmax(logits: &[f32]) -> u32 {
-    logits.iter().enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
-}

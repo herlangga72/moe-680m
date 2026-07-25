@@ -4,22 +4,20 @@
 
 pub struct TokenizerData {
     pub tokens: Vec<String>,
+    #[cfg_attr(not(feature = "gigatoken"), allow(dead_code))]
     pub scores: Vec<f32>,
     pub merges: Vec<String>,
     pub bos_id: u32,
     pub eos_id: u32,
-    pub model_type: String,
 }
 
 impl TokenizerData {
     pub fn from_gguf_meta(
-        get_str: &dyn Fn(&str) -> Option<String>,
         get_arr: &dyn Fn(&str) -> Option<Vec<String>>,
         get_float_arr: &dyn Fn(&str) -> Option<Vec<f32>>,
         get_int: &dyn Fn(&str) -> Option<u32>,
     ) -> Result<Self, String> {
         Ok(TokenizerData {
-            model_type: get_str("tokenizer.ggml.model").unwrap_or_else(|| "gpt2".into()),
             tokens: get_arr("tokenizer.ggml.tokens").ok_or("Missing tokenizer.ggml.tokens")?,
             scores: get_float_arr("tokenizer.ggml.scores").unwrap_or_default(),
             merges: get_arr("tokenizer.ggml.merges").unwrap_or_default(),

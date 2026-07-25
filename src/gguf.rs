@@ -93,11 +93,9 @@ impl GgmlType {
 #[derive(Clone, Debug)]
 pub struct TensorInfo {
     pub name: String,
-    pub n_dims: u32,
-    pub dims: Vec<u64>,
     pub ggml_type: GgmlType,
-    pub offset: u64,  // byte offset from start of tensor data section
-    pub size: u64,    // bytes on disk
+    pub offset: u64,
+    pub size: u64,
 }
 
 // ── Model Configuration ──
@@ -111,11 +109,6 @@ pub struct ModelConfig {
     pub feed_forward_length: u32,
     pub expert_count: u32,
     pub expert_used_count: u32,
-    pub attention_head_count: u32,
-    pub attention_head_count_kv: u32,
-    pub head_dim: u32,
-    pub rope_dim: u32,
-    pub rope_freq_base: f32,
     pub quant_type: GgmlType,
 }
 
@@ -133,11 +126,6 @@ impl ModelConfig {
             feed_forward_length: meta_get_int(meta, "llama.feed_forward_length")? as u32,
             expert_count: meta_get_int(meta, "llama.expert_count")? as u32,
             expert_used_count: meta_get_int(meta, "llama.expert_used_count")? as u32,
-            attention_head_count: meta_get_int(meta, "llama.attention.head_count")? as u32,
-            attention_head_count_kv: meta_get_int(meta, "llama.attention.head_count_kv")? as u32,
-            head_dim: meta_get_int(meta, "llama.attention.head_dim").unwrap_or(128) as u32,
-            rope_dim: meta_get_int(meta, "llama.rope.dimension_count").unwrap_or(64) as u32,
-            rope_freq_base: meta_get_float(meta, "llama.rope.freq_base").unwrap_or(10000.0),
             quant_type,
         })
     }
@@ -147,7 +135,6 @@ impl ModelConfig {
 
 pub struct GgufReader<'a> {
     pub data: &'a [u8],
-    pub version: u32,
     pub tensor_count: u64,
     pub metadata: HashMap<String, MetadataValue>,
     pub tensors: Vec<TensorInfo>,
@@ -216,7 +203,6 @@ impl<'a> GgufReader<'a> {
 
         Ok(GgufReader {
             data,
-            version,
             tensor_count,
             metadata,
             tensors,
@@ -225,30 +211,19 @@ impl<'a> GgufReader<'a> {
         })
     }
 
-    /// Get raw bytes for a tensor from the mmap.
-    pub fn tensor_bytes(&self, ti: &TensorInfo) -> &[u8] {
-        let start = (self.tensor_data_offset + ti.offset) as usize;
-        &self.data[start..start + ti.size as usize]
-    }
 }
 
 // ── Metadata Values ──
 
 #[derive(Clone, Debug)]
 pub enum MetadataValue {
-    Uint8(u8),
-    Int8(i8),
-    Uint16(u16),
-    Int16(i16),
+    Float32(f32),
     Uint32(u32),
     Int32(i32),
-    Float32(f32),
-    Bool(bool),
     String(String),
     Array(Vec<MetadataValue>),
     Uint64(u64),
     Int64(i64),
-    Float64(f64),
 }
 
 fn parse_metadata_kv(data: &[u8], off: &mut u64) -> Result<(String, MetadataValue), String> {
@@ -259,19 +234,17 @@ fn parse_metadata_kv(data: &[u8], off: &mut u64) -> Result<(String, MetadataValu
 }
 
 fn read_metadata_value(data: &[u8], off: &mut u64, ty: u32) -> Result<MetadataValue, String> {
+    // Types this parser doesn't use: advance offset by size, return dummy
+    let mut skip = |n: u64| { *off += n; Ok(MetadataValue::Uint32(0)) };
     match ty {
-        0 => Ok(MetadataValue::Uint8(read_u8(data, off))),
-        1 => Ok(MetadataValue::Int8(read_i8(data, off))),
-        2 => Ok(MetadataValue::Uint16(read_u16(data, off))),
-        3 => Ok(MetadataValue::Int16(read_i16(data, off))),
+        0 | 1 => skip(1),
+        2 | 3 => skip(2),
+        7 => skip(4),   // GGUF_BOOL
+        12 => skip(8),  // GGUF_FLOAT64
+        6 => Ok(MetadataValue::Float32(f32::from_bits(read_u32(data, off)))),
         4 => Ok(MetadataValue::Uint32(read_u32(data, off))),
         5 => Ok(MetadataValue::Int32(read_i32(data, off))),
-        6 => Ok(MetadataValue::Float32(read_f32(data, off))),
-        7 => Ok(MetadataValue::Bool(read_u8(data, off) != 0)),
-        8 => {
-            let s = read_string(data, off)?;
-            Ok(MetadataValue::String(s))
-        }
+        8 => { let s = read_string(data, off)?; Ok(MetadataValue::String(s)) }
         9 => {
             let arr_type = read_u32(data, off);
             let arr_len = read_u64(data, off);
@@ -283,7 +256,6 @@ fn read_metadata_value(data: &[u8], off: &mut u64, ty: u32) -> Result<MetadataVa
         }
         10 => Ok(MetadataValue::Uint64(read_u64(data, off))),
         11 => Ok(MetadataValue::Int64(read_i64(data, off))),
-        12 => Ok(MetadataValue::Float64(read_f64(data, off))),
         _ => Err(format!("Unknown metadata value type: {}", ty)),
     }
 }
@@ -313,8 +285,6 @@ fn parse_tensor_info(data: &[u8], off: &mut u64) -> Result<TensorInfo, String> {
 
     Ok(TensorInfo {
         name,
-        n_dims,
-        dims,
         ggml_type,
         offset,
         size,
@@ -347,39 +317,7 @@ fn meta_get_int(meta: &HashMap<String, MetadataValue>, key: &str) -> Result<u64,
         .ok_or_else(|| format!("Missing metadata key: {}", key))
 }
 
-fn meta_get_float(meta: &HashMap<String, MetadataValue>, key: &str) -> Option<f32> {
-    meta.get(key).map(|v| match v {
-        MetadataValue::Float32(x) => *x,
-        MetadataValue::Float64(x) => *x as f32,
-        _ => 0.0,
-    })
-}
-
 // ── Binary Readers ──
-
-fn read_u8(data: &[u8], off: &mut u64) -> u8 {
-    let v = data[*off as usize];
-    *off += 1;
-    v
-}
-
-fn read_i8(data: &[u8], off: &mut u64) -> i8 {
-    let v = data[*off as usize] as i8;
-    *off += 1;
-    v
-}
-
-fn read_u16(data: &[u8], off: &mut u64) -> u16 {
-    let v = u16::from_le_bytes([data[*off as usize], data[*off as usize + 1]]);
-    *off += 2;
-    v
-}
-
-fn read_i16(data: &[u8], off: &mut u64) -> i16 {
-    let v = i16::from_le_bytes([data[*off as usize], data[*off as usize + 1]]);
-    *off += 2;
-    v
-}
 
 fn read_u32(data: &[u8], off: &mut u64) -> u32 {
     let v = u32::from_le_bytes([
@@ -431,32 +369,6 @@ fn read_i64(data: &[u8], off: &mut u64) -> i64 {
     ];
     *off += 8;
     i64::from_le_bytes(bytes)
-}
-
-fn read_f32(data: &[u8], off: &mut u64) -> f32 {
-    let v = f32::from_le_bytes([
-        data[*off as usize],
-        data[*off as usize + 1],
-        data[*off as usize + 2],
-        data[*off as usize + 3],
-    ]);
-    *off += 4;
-    v
-}
-
-fn read_f64(data: &[u8], off: &mut u64) -> f64 {
-    let v = f64::from_le_bytes([
-        data[*off as usize],
-        data[*off as usize + 1],
-        data[*off as usize + 2],
-        data[*off as usize + 3],
-        data[*off as usize + 4],
-        data[*off as usize + 5],
-        data[*off as usize + 6],
-        data[*off as usize + 7],
-    ]);
-    *off += 8;
-    v
 }
 
 fn read_string(data: &[u8], off: &mut u64) -> Result<String, String> {

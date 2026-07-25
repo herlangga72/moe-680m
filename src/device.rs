@@ -5,16 +5,13 @@ use std::ffi::CString;
 pub struct DeviceContext {
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
-    pub physical_device: vk::PhysicalDevice,
     pub device: ash::Device,
     pub queue: vk::Queue,
     pub queue_family: u32,
     pub uma_memory_type: u32,
-    pub max_memory_allocation_size: u64,
     pub max_compute_shared_memory_size: u32,
     pub device_name: String,
     pub driver_version: String,
-    pub has_buffer_device_address: bool,
 }
 
 impl DeviceContext {
@@ -115,24 +112,11 @@ impl DeviceContext {
         }
 
         // Get the selected physical device
-        let (selected_pd, _selected_name, _selected_props, _selected_uma, _selected_qf) =
+        let (physical_device, device_name, props, uma_memory_type, queue_family) =
             selected.ok_or_else(|| {
                 "No device with UMA memory (DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT) found."
                     .to_string()
             })?;
-
-        // Query maxMemoryAllocationSize from Maintenance3Properties
-        let mut maint3 = vk::PhysicalDeviceMaintenance3Properties::default();
-        let mut props2 = vk::PhysicalDeviceProperties2 {
-            p_next: &mut maint3 as *mut _ as *mut std::ffi::c_void,
-            ..Default::default()
-        };
-        unsafe { instance.get_physical_device_properties2(selected_pd, &mut props2); }
-        let max_alloc = maint3.max_memory_allocation_size;
-
-        // Re-extract named vars for the rest of the function
-        let (physical_device, device_name, props, uma_memory_type, queue_family) =
-            (selected_pd, _selected_name, _selected_props, _selected_uma, _selected_qf);
 
         // ── Logical device ──
         let queue_priorities = [1.0f32];
@@ -194,7 +178,7 @@ impl DeviceContext {
             features16.p_next = features_f16_ptr;
         }
 
-        let mut create_info = vk::DeviceCreateInfo {
+        let create_info = vk::DeviceCreateInfo {
             queue_create_info_count: 1,
             p_queue_create_infos: &queue_info,
             enabled_extension_count: extension_name_ptrs.len() as u32,
@@ -214,12 +198,10 @@ impl DeviceContext {
         Ok(DeviceContext {
             _entry: entry,
             instance,
-            physical_device,
             device,
             queue,
             queue_family,
             uma_memory_type,
-            max_memory_allocation_size: max_alloc,
             max_compute_shared_memory_size: props.limits.max_compute_shared_memory_size,
             device_name,
             driver_version: format!(
@@ -228,7 +210,6 @@ impl DeviceContext {
                 vk::api_version_major(props.driver_version),
                 vk::api_version_minor(props.driver_version)
             ),
-            has_buffer_device_address: has_bda,
         })
     }
 

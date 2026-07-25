@@ -12,7 +12,7 @@ macro_rules! debug_log {
     };
 }
 
-pub const MAX_PIPELINES: usize = 19;
+pub const MAX_PIPELINES: usize = 20;
 
 /// Pipeline type enum — direct index into `pipelines[]`.
 #[repr(u32)]
@@ -28,15 +28,13 @@ pub enum PipelineType {
     W1W3Fused = 7,
     W2 = 8,
     Router = 9,
-    MoeCombine = 10,
-    SharedExpert = 11,
+    RouterTopk = 10,
+    MoeCombine = 11,
     W2Scatter = 12,
     KvWrite = 13,
     ResidualAdd = 14,
     SiluMult = 15,
     Rope = 16,
-    MtpHead = 17,
-    MtpOutput = 18,
 }
 
 pub struct PipelineResources {
@@ -113,8 +111,9 @@ pub unsafe fn create_pipelines(
         .create_pipeline_layout(&layout_info, None)
         .map_err(|e| format!("Failed to create pipeline layout: {}", e))?;
 
-    // ── Pipeline cache (load from disk if available) ──
-    let (cache_data, _cache_loaded) = (std::fs::read("pipeline_cache.bin").unwrap_or_default(), false);
+    // ── Pipeline cache (load from temp dir if available) ──
+    let cache_path = std::env::temp_dir().join("moe_pipeline_cache.bin");
+    let (cache_data, _cache_loaded) = (std::fs::read(&cache_path).unwrap_or_default(), false);
     let cache_info = vk::PipelineCacheCreateInfo {
         initial_data_size: cache_data.len(),
         p_initial_data: if cache_data.is_empty() { ptr::null() } else { cache_data.as_ptr() as *const _ },
@@ -130,7 +129,7 @@ pub unsafe fn create_pipelines(
     // ── Helper: load SPV, create module, create pipeline ──
     let entry = CStr::from_bytes_with_nul(b"main\0").unwrap();
 
-    let mut create_one = |spv_bytes: &[u8], layout: vk::PipelineLayout|
+    let create_one = |spv_bytes: &[u8], layout: vk::PipelineLayout|
         -> Result<vk::Pipeline, String> {
         // SPIR-V binary: bytes to u32 slice
         let word_count = spv_bytes.len() / 4;
@@ -203,18 +202,17 @@ pub unsafe fn create_pipelines(
     try_pipeline!(PipelineType::W2, "w2");
     try_pipeline!(PipelineType::W2Scatter, "w2_scatter");
     try_pipeline!(PipelineType::Router, "router");
+    try_pipeline!(PipelineType::RouterTopk, "router_topk");
     try_pipeline!(PipelineType::MoeCombine, "moe_combine");
     try_pipeline!(PipelineType::KvWrite, "kv_write");
     try_pipeline!(PipelineType::ResidualAdd, "residual_add");
     try_pipeline!(PipelineType::SiluMult, "silu_mult");
     try_pipeline!(PipelineType::Rope, "rope");
-    try_pipeline!(PipelineType::MtpHead, "attn_output");
-    try_pipeline!(PipelineType::MtpOutput, "attn_output");
 
     // Save pipeline cache
     if let Ok(data) = device.get_pipeline_cache_data(pipeline_cache) {
         if !data.is_empty() {
-            let _ = std::fs::write("pipeline_cache.bin", &data);
+            let _ = std::fs::write(&cache_path, &data);
         }
     }
 
