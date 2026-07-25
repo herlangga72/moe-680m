@@ -28,6 +28,7 @@ const ALIGN: u64 = 64; // cache line size
 
 impl ArenaLayout {
     pub fn compute(cfg: &ModelConfig, weights_size: u64) -> Self {
+        // Offset 0 reserved as null sentinel (lookup returns 0 for missing tensors)
         let mut off = ALIGN;
 
         // Weights
@@ -42,6 +43,7 @@ impl ArenaLayout {
         off += hidden_per_buffer;
 
         // KV cache: Q4_0, (512/32)*18 = 288 B/token for K + 288 B/token for V
+        // 10 GQA layers (every 4th, indices 3,7,...,39). kv_cache_size/10 = per-layer slice.
         let kv_per_layer = cfg.context_length as u64 * 288 * 2;
         let kv_cache_size = align(10 * kv_per_layer);
         let kv_cache_base = off;
@@ -108,6 +110,7 @@ impl TensorRegistry {
     pub fn from_tensors(
         tensors: &[TensorInfo],
         weights_base: u64,
+        cfg: &ModelConfig,
     ) -> Self {
         let by_name: std::collections::HashMap<&str, &TensorInfo> =
             tensors.iter().map(|t| (t.name.as_str(), t)).collect();
@@ -127,8 +130,8 @@ impl TensorRegistry {
             }
         };
 
-        let max_layer = 40u32;
-        let max_exp = 256u32;
+        let max_layer = cfg.block_count;
+        let max_exp = cfg.expert_count;
 
         // Group 0: embedding
         add("token_embd.weight");

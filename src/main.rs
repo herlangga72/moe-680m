@@ -208,7 +208,7 @@ fn run_inference(model_path: &str, prompt_text: Option<&str>, max_tokens: u32,
     };
 
     // 6. Load weights
-    let reg = memory::TensorRegistry::from_tensors(&tensors, layout.weights_base);
+    let reg = memory::TensorRegistry::from_tensors(&tensors, layout.weights_base, &config);
     unsafe {
         memory::load_weights_from_tensors(&reader, &tensors, &reg, arena_ptr);
         // madvise hint: no longer need GGUF mmap pages after tensor copy
