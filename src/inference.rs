@@ -7,7 +7,7 @@ use crate::memory::{ArenaLayout, LayerWeights};
 use crate::pipeline::{PipelineResources, PipelineType};
 use crate::router;
 use crate::sampling::{self, SamplingParams, SamplingContext};
-use crate::util::{f16_bits_to_f32, f32_to_f16_bits, read_u16, VOCAB_SIZE};
+use crate::util::{f16_bits_to_f32, read_u16, VOCAB_SIZE};
 use ash::vk;
 
 // ── Push constants (matches GLSL, 128 bytes) ──
@@ -190,12 +190,13 @@ impl InferenceEngine {
             + token_id as usize * blocks_per_token * 36) };
         let dst = unsafe { self.arena_base.add(self.layout.hidden_ping as usize
             + pos as usize * hs * 2) } as *mut u8;
-        // Dequantize IQ4_XS → f16
+        // Dequantize IQ4_XS → f16 (batch SIMD f32→f16 conversion)
         for b in 0..blocks_per_token {
             let bo = b * 36;
             let d0 = f16_bits_to_f32(read_u16(src, bo));
             let d2 = f16_bits_to_f32(read_u16(src, bo + 2));
             let nv = (hs - b * 32).min(32);
+            let mut f32_buf = [0.0f32; 32];
             for i in 0..nv {
                 let d = [d0, d2][(i >> 4) as usize];
                 let nibble = unsafe { *src.add(bo + 4 + (i >> 1)) };
@@ -203,8 +204,12 @@ impl InferenceEngine {
                 let high_byte = unsafe { *src.add(bo + 20 + (i >> 3)) };
                 let high = (high_byte >> (i & 7)) & 1;
                 let q = q_val | (high << 4);
-                let val = (q as f32 - 8.0) * d;
-                let f16 = f32_to_f16_bits(val);
+                f32_buf[i] = (q as f32 - 8.0) * d;
+            }
+            let mut f16_buf = [0u16; 32];
+            crate::util::f32_slice_to_f16(&f32_buf[..nv], &mut f16_buf[..nv]);
+            for i in 0..nv {
+                let f16 = f16_buf[i];
                 let di = (b * 32 + i) * 2;
                 unsafe {
                     *dst.add(di) = f16 as u8;

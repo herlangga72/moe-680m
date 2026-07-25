@@ -74,3 +74,36 @@ pub fn argmax(slice: &[f32]) -> u32 {
     }
     best_i
 }
+
+// ── SIMD batch f32→f16 (F16C vcvtps2ph when available) ──
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,f16c")]
+unsafe fn f32_slice_to_f16_avx(src: &[f32], dst: &mut [u16]) {
+    let n = src.len().min(dst.len());
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let f = std::arch::x86_64::_mm256_loadu_ps(src.as_ptr().add(i));
+        let v = std::arch::x86_64::_mm256_cvtps_ph(f, 0);
+        std::arch::x86_64::_mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut _, v);
+        i += 8;
+    }
+    for j in i..n {
+        dst[j] = f32_to_f16_bits(src[j]);
+    }
+}
+
+pub fn f32_slice_to_f16(src: &[f32], dst: &mut [u16]) {
+    let n = src.len().min(dst.len());
+    #[cfg(target_arch = "x86_64")]
+    if n >= 8
+        && std::arch::is_x86_feature_detected!("avx")
+        && std::arch::is_x86_feature_detected!("f16c")
+    {
+        unsafe { f32_slice_to_f16_avx(src, dst); }
+        return;
+    }
+    for i in 0..n {
+        dst[i] = f32_to_f16_bits(src[i]);
+    }
+}
