@@ -15,7 +15,7 @@ layout(push_constant) uniform PC {
 
 #include "common.glsl"
 
-shared float At[64][32];  // 8 KB
+shared float At[64][33];  // 8 KB
 shared float Bt[32][8];    // 1 KB
 layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
 

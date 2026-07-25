@@ -1,13 +1,12 @@
 // Job 13: Anthropic-compatible HTTP API server
-// Single-user. No auth, no multi-user queuing.
-// POST /v1/messages — Anthropic Messages API format.
+// Single-user. POST /v1/messages — Anthropic Messages API format.
 
-use crate::gguf::ModelConfig;
-use crate::inference::InferenceEngine;
-use crate::sampling::{self, SamplingParams, StopConditions, ConversationSession, StopReason};
+use crate::inference::{InferenceEngine, InferenceState};
+use crate::tokenizer::Tokenizer;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Mutex;
 
 #[derive(Deserialize)]
 struct MessagesRequest {
@@ -16,8 +15,6 @@ struct MessagesRequest {
     system: Option<String>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
-    top_p: Option<f32>,
-    top_k: Option<u32>,
     stream: Option<bool>,
 }
 
@@ -35,9 +32,7 @@ struct MessagesResponse {
     role: String,
     content: Vec<ContentBlock>,
     model: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     stop_reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     stop_sequence: Option<String>,
     usage: Usage,
 }
@@ -65,7 +60,8 @@ impl Server {
         Self { host: host.to_string(), port }
     }
 
-    pub fn run(&self, model: ModelConfig, _engine: Mutex<InferenceEngine>) {
+    pub fn run(&self, _cfg: crate::gguf::ModelConfig, tokenizer: Tokenizer,
+               engine: Mutex<InferenceEngine>) {
         let addr = format!("{}:{}", self.host, self.port);
         eprintln!("Server listening on http://{}", addr);
 
@@ -75,7 +71,7 @@ impl Server {
         for stream in listener.incoming() {
             match stream {
                 Ok(mut s) => {
-                    if let Err(e) = handle_connection(&mut s, &model, &mut session) {
+                    if let Err(e) = handle_connection(&mut s, &tokenizer, &engine, &mut session) {
                         eprintln!("Connection error: {}", e);
                     }
                 }
@@ -85,21 +81,22 @@ impl Server {
     }
 }
 
-fn handle_connection(stream: &mut TcpStream, _model: &ModelConfig,
+fn handle_connection(stream: &mut TcpStream, tokenizer: &Tokenizer,
+                     engine: &Mutex<InferenceEngine>,
                      session: &mut ConversationSession) -> Result<(), String> {
-    let mut buf = [0u8; 16384];
+    let mut buf = [0u8; 65536];
     let n = stream.read(&mut buf).map_err(|e| format!("Read: {}", e))?;
     if n == 0 { return Ok(()); }
 
     let request = std::str::from_utf8(&buf[..n]).map_err(|_| "Invalid UTF-8".to_string())?;
 
-    // Parse HTTP: find body after \r\n\r\n
     let body_start = request.find("\r\n\r\n").ok_or("No headers")? + 4;
     let content_len = request.lines()
         .find(|l| l.to_lowercase().starts_with("content-length:"))
         .and_then(|l| l.split(':').nth(1)?.trim().parse::<usize>().ok())
         .unwrap_or(0);
-    let body = &buf[body_start..body_start + content_len.min(buf.len() - body_start)];
+    let body_end = body_start + content_len.min(buf.len() - body_start);
+    let body = &buf[body_start..body_end];
 
     if !request.starts_with("POST /v1/messages") {
         write_json(stream, 404, r#"{"error":"not found"}"#)?;
@@ -109,29 +106,14 @@ fn handle_connection(stream: &mut TcpStream, _model: &ModelConfig,
     let req: MessagesRequest = serde_json::from_slice(body)
         .map_err(|e| format!("JSON parse: {}", e))?;
 
-    // Apply chat template
     let prompt = apply_chat_template(&req.messages, req.system.as_deref());
+    let input_ids = tokenizer.encode(&prompt);
+    let max_tokens = req.max_tokens.unwrap_or(4096);
 
-    // Build sampling params
-    let params = SamplingParams {
-        temperature: req.temperature.unwrap_or(1.0),
-        top_p: req.top_p.unwrap_or(1.0),
-        top_k: req.top_k.unwrap_or(0),
-        max_tokens: req.max_tokens.unwrap_or(4096),
-        ..Default::default()
-    };
-
-    let stop_conditions = StopConditions {
-        eos_token_id: u32::MAX, // Placeholder — get actual EOS from model
-        ..Default::default()
-    };
-
-    // TODO: actually run inference here
-    // For now, return a mock response showing the format works
     if req.stream.unwrap_or(false) {
-        write_streaming_response(stream, &prompt, &params, &stop_conditions, session)
+        write_streaming(stream, tokenizer, engine, &input_ids, max_tokens, session)
     } else {
-        write_json_response(stream, &prompt, &params, &stop_conditions, session)
+        write_json_response(stream, tokenizer, engine, &input_ids, max_tokens, session)
     }
 }
 
@@ -153,63 +135,81 @@ fn apply_chat_template(messages: &[Message], system: Option<&str>) -> String {
     out
 }
 
-fn write_json_response(stream: &mut TcpStream, _prompt: &str,
-                       _params: &SamplingParams, _stops: &StopConditions,
-                       _session: &mut ConversationSession) -> Result<(), String> {
+fn write_json_response(stream: &mut TcpStream, tokenizer: &Tokenizer,
+                       engine: &Mutex<InferenceEngine>, input_ids: &[u32],
+                       max_tokens: u32, _session: &mut ConversationSession) -> Result<(), String> {
+    let mut engine = engine.lock().unwrap();
+    let mut state = InferenceState::new();
+    let mut output_ids = Vec::new();
+
+    for _ in 0..max_tokens {
+        match engine.generate(input_ids, &mut state) {
+            Ok(token) => {
+                output_ids.push(token);
+                if token == tokenizer.eos_id { break; }
+            }
+            Err(e) => { eprintln!("Inference error: {}", e); break; }
+        }
+    }
+
+    let text = tokenizer.decode(&output_ids);
+
     let resp = MessagesResponse {
-        id: format!("msg_{:016x}", 42u64), // TODO: use real ID generator
+        id: format!("msg_{:016x}", 42u64),
         resp_type: "message".into(),
         role: "assistant".into(),
-        content: vec![ContentBlock {
-            block_type: "text".into(),
-            text: "Hello from moe-680m! (inference not yet wired)".into(),
-        }],
+        content: vec![ContentBlock { block_type: "text".into(), text }],
         model: "qwen3.6-35b-a3b".into(),
         stop_reason: Some("end_turn".into()),
         stop_sequence: None,
-        usage: Usage { input_tokens: 0, output_tokens: 0 },
+        usage: Usage { input_tokens: input_ids.len() as u32, output_tokens: output_ids.len() as u32 },
     };
 
     let body = serde_json::to_string(&resp).map_err(|e| format!("Serialize: {}", e))?;
     write_json(stream, 200, &body)
 }
 
-fn write_streaming_response(stream: &mut TcpStream, _prompt: &str,
-                            _params: &SamplingParams, _stops: &StopConditions,
-                            _session: &mut ConversationSession) -> Result<(), String> {
-    // SSE headers
+fn write_streaming(stream: &mut TcpStream, tokenizer: &Tokenizer,
+                   engine: &Mutex<InferenceEngine>, input_ids: &[u32],
+                   max_tokens: u32, _session: &mut ConversationSession) -> Result<(), String> {
     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: keep-alive\r\n\r\n")
         .map_err(|e| format!("Write: {}", e))?;
     stream.flush().ok();
 
     let msg_id = format!("msg_{:016x}", 42u64);
 
-    // message_start
     sse_write(stream, "message_start",
-        &format!(r#"{{"type":"message_start","message":{{"id":"{}","type":"message","role":"assistant","content":[],"model":"qwen3.6-35b-a3b","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":0,"output_tokens":0}}}}}}"#, msg_id))?;
+        &format!(r#"{{"type":"message_start","message":{{"id":"{}","type":"message","role":"assistant","content":[],"model":"qwen3.6-35b-a3b","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{},"output_tokens":0}}}}}}"#, msg_id, input_ids.len()))?;
 
-    // content_block_start
     sse_write(stream, "content_block_start",
         r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#)?;
 
-    // Mock tokens (TODO: replace with actual generation loop)
-    for word in &["Hello", " from", " moe-680m", "!"] {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        sse_write(stream, "content_block_delta",
-            &format!(r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{}"}}}}"#, word))?;
+    let mut engine = engine.lock().unwrap();
+    let mut state = InferenceState::new();
+    let mut output_ids = Vec::new();
+    let mut token_count = 0u32;
+
+    for _ in 0..max_tokens {
+        match engine.generate(input_ids, &mut state) {
+            Ok(token) => {
+                output_ids.push(token);
+                token_count += 1;
+                let text = tokenizer.decode(&[token]);
+
+                sse_write(stream, "content_block_delta",
+                    &format!(r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{}"#,
+                        serde_json::to_string(&text).unwrap_or_default()))?;
+
+                if token == tokenizer.eos_id { break; }
+            }
+            Err(e) => { eprintln!("Inference error: {}", e); break; }
+        }
     }
 
-    // content_block_stop
-    sse_write(stream, "content_block_stop",
-        r#"{"type":"content_block_stop","index":0}"#)?;
-
-    // message_delta
+    sse_write(stream, "content_block_stop", r#"{"type":"content_block_stop","index":0}"#)?;
     sse_write(stream, "message_delta",
-        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}"#)?;
-
-    // message_stop
-    sse_write(stream, "message_stop",
-        r#"{"type":"message_stop"}"#)?;
+        &format!(r#"{{"type":"message_delta","delta":{{"stop_reason":"end_turn","stop_sequence":null}},"usage":{{"output_tokens":{}}}}}"#, token_count))?;
+    sse_write(stream, "message_stop", r#"{"type":"message_stop"}"#)?;
 
     Ok(())
 }
@@ -228,4 +228,13 @@ fn write_json(stream: &mut TcpStream, status: u16, body: &str) -> Result<(), Str
         .map_err(|e| format!("Write: {}", e))?;
     stream.flush().ok();
     Ok(())
+}
+
+// Session struct for multi-turn (placeholder)
+struct ConversationSession {
+    // In production: store KV cache state, conversation history
+}
+
+impl ConversationSession {
+    fn new() -> Self { Self {} }
 }

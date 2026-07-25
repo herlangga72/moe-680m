@@ -6,6 +6,8 @@ mod inference;
 mod router;
 mod sampling;
 mod tokenizer;
+#[cfg(feature = "server")]
+mod server;
 
 use std::env;
 
@@ -261,7 +263,25 @@ fn run_inference(model_path: &str, prompt_text: Option<&str>, max_tokens: u32,
         Err(err) => { eprintln!("❌ Engine: {}", err); return; }
     };
 
-    // 10. Run inference
+    // 10. Server mode or inference mode
+    if let Some(port) = server_port {
+        #[cfg(feature = "server")]
+        {
+            use std::sync::Mutex;
+            let srv = server::Server::new("127.0.0.1", port);
+            eprintln!("Starting server on :{}", port);
+            srv.run(config, tokenizer, Mutex::new(engine));
+            // Server blocks; never returns
+        }
+        #[cfg(not(feature = "server"))]
+        {
+            eprintln!("Server feature not enabled. Build with: cargo build --features server");
+            unsafe { engine.device.device.free_memory(arena_mem, None); }
+        }
+        return;
+    }
+
+    // 11. CLI inference mode
     if let Some(prompt_text) = prompt_text {
         eprintln!("Prompt: {}", prompt_text);
         let input_ids = tokenizer.encode(prompt_text);

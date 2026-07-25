@@ -1,0 +1,71 @@
+// ── Rotary Position Embedding for GQA attention ──
+// Applies RoPE to first 64 dims of Q (16 heads) and K (2 heads)
+// Input/Output: Q[4096] + K[512] + V[512] at input_offset
+//   Q layout: 16 heads × 256 dim, RoPE applied to dims 0..63
+//   K layout: 2 heads × 256 dim, RoPE applied to dims 0..63
+// Position: pc.K
+// Base: 10000.0
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset; uint64_t weights_offset; uint64_t output_offset;
+    uint M; uint N; uint K; uint num_experts;
+    uint64_t routing_weights_off; uint num_qk_heads; uint num_v_heads;
+    uint layer_idx; uint _pad1; uint64_t token_ids_off; float scale_factor;
+} pc;
+
+#include "common.glsl"
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint tok = gl_GlobalInvocationID.x;   // 0..M-1
+    uint h = gl_GlobalInvocationID.y;      // 0..17 (heads 0..15 = Q, 16..17 = K)
+    uint i = gl_LocalInvocationIndex;       // 0..63 (dimension pair index)
+
+    if (tok >= pc.M || h >= 18) return;
+    if (i >= 32) return; // only 32 pairs (64 dims) need RoPE
+
+    uint pos = pc.K; // token position
+
+    // Precompute cos/sin for this position and pair
+    float inv_freq = 1.0 / pow(10000.0, float(2 * i) / 64.0);
+    float theta = float(pos) * inv_freq;
+    float cos_t = cos(theta);
+    float sin_t = sin(theta);
+
+    // QKV layout per token: Q[4096] + K[512] + V[512] = 5120 f16
+    // Q heads 0..15 at stride 256, K heads 0..1 at offset 4096
+    uint64_t q_base = pc.input_offset + uint64_t(tok) * 5120 * 2;
+    uint64_t k_base = q_base + 4096 * 2;
+    uint64_t base = (h < 16) ? (q_base + h * 256 * 2) : (k_base + (h - 16) * 256 * 2);
+    uint dim_2i = i * 2;
+    uint dim_2i1 = i * 2 + 1;
+
+    // Read Q[2i] and Q[2i+1]
+    uint64_t a0 = base + dim_2i * 2;
+    uint w0 = data[uint(a0>>2)];
+    float v0 = f16_to_f32((w0>>(uint(a0&3)*8))&0xFFFF);
+
+    uint64_t a1 = base + dim_2i1 * 2;
+    uint w1 = data[uint(a1>>2)];
+    float v1 = f16_to_f32((w1>>(uint(a1&3)*8))&0xFFFF);
+
+    // Apply rotation
+    float r0 = v0 * cos_t - v1 * sin_t;
+    float r1 = v0 * sin_t + v1 * cos_t;
+
+    // Write back
+    uint f16_0 = f32_to_f16(r0);
+    uint f16_1 = f32_to_f16(r1);
+
+    uint wi0 = uint(a0>>2), sh0 = uint(a0&3)*8;
+    data[wi0] = (data[wi0]&~(0xFFFFu<<sh0)) | (f16_0<<sh0);
+
+    uint wi1 = uint(a1>>2), sh1 = uint(a1&3)*8;
+    data[wi1] = (data[wi1]&~(0xFFFFu<<sh1)) | (f16_1<<sh1);
+}

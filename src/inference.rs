@@ -355,6 +355,15 @@ impl InferenceEngine {
             unsafe { dev.cmd_dispatch(cmd, self.div64(M), self.div8(512), 1); }
             self.barrier(cmd);
 
+            // ── (C2) RoPE: apply rotary position embedding to Q and K ──
+            self.bind_pipe(cmd, PipelineType::Rope);
+            pc.input_offset = tmp + M as u64 * hidden as u64 * 2; // Q+K+V buffer
+            pc.M = M; pc.K = s.seq_len + M - 1; // position = total tokens - 1 for last
+            pc.num_qk_heads = 16; pc.num_v_heads = 2;
+            self.push(cmd, &pc);
+            unsafe { dev.cmd_dispatch(cmd, M, 18, 1); } // 16 Q + 2 K heads
+            self.barrier(cmd);
+
             // ── (H4/M3) KV cache write at position s.seq_len ──
             // GQA layers are at indices 3,7,11,...,39 → compact index = layer/4
             let gqa_idx = layer / 4;

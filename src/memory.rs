@@ -349,20 +349,7 @@ impl LayerWeights {
 
 // ── Weight Loading ──
 
-/// Copy all tensors from GGUF file into the arena.
-/// The GGUF reader holds the mmap data, the arena is GPU-mapped.
-pub unsafe fn load_weights(
-    reader: &GgufReader,
-    reg: &TensorRegistry,
-    arena_base: *mut u8,
-) {
-    for entry in &reg.entries {
-        // Find the TensorInfo by hash (we could store the file offset, but this is simpler)
-        // Iterate entries to copy data from GGUF to arena.
-    }
-}
-
-/// Alternative: Copy using TensorInfo list (from reader) + TensorRegistry (for dest offset).
+/// Copy weights from GGUF tensors to arena using TensorRegistry offsets.
 pub unsafe fn load_weights_from_tensors(
     reader: &GgufReader,
     tensors: &[crate::gguf::TensorInfo],

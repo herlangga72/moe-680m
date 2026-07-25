@@ -12,7 +12,7 @@ macro_rules! debug_log {
     };
 }
 
-pub const MAX_PIPELINES: usize = 16;
+pub const MAX_PIPELINES: usize = 17;
 
 /// Pipeline type enum — direct index into `pipelines[]`.
 #[repr(u32)]
@@ -34,6 +34,7 @@ pub enum PipelineType {
     KvWrite = 13,
     ResidualAdd = 14,
     SiluMult = 15,
+    Rope = 16,
 }
 
 pub struct PipelineResources {
@@ -110,15 +111,19 @@ pub unsafe fn create_pipelines(
         .create_pipeline_layout(&layout_info, None)
         .map_err(|e| format!("Failed to create pipeline layout: {}", e))?;
 
-    // ── Pipeline cache ──
+    // ── Pipeline cache (load from disk if available) ──
+    let (cache_data, _cache_loaded) = (std::fs::read("pipeline_cache.bin").unwrap_or_default(), false);
     let cache_info = vk::PipelineCacheCreateInfo {
-        initial_data_size: 0,
-        p_initial_data: ptr::null(),
+        initial_data_size: cache_data.len(),
+        p_initial_data: if cache_data.is_empty() { ptr::null() } else { cache_data.as_ptr() as *const _ },
         ..Default::default()
     };
     let pipeline_cache = device
         .create_pipeline_cache(&cache_info, None)
         .map_err(|e| format!("Failed to create pipeline cache: {}", e))?;
+    if !cache_data.is_empty() {
+        debug_log!(debug, "  Pipeline cache loaded: {} bytes", cache_data.len());
+    }
 
     // ── Helper: load SPV, create module, create pipeline ──
     let entry = CStr::from_bytes_with_nul(b"main\0").unwrap();
@@ -200,6 +205,7 @@ pub unsafe fn create_pipelines(
     try_pipeline!(PipelineType::KvWrite, "kv_write");
     try_pipeline!(PipelineType::ResidualAdd, "residual_add");
     try_pipeline!(PipelineType::SiluMult, "silu_mult");
+    try_pipeline!(PipelineType::Rope, "rope");
 
     // Save pipeline cache
     if let Ok(data) = device.get_pipeline_cache_data(pipeline_cache) {
