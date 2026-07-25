@@ -189,11 +189,12 @@ impl InferenceEngine {
     pub fn generate(&mut self, tokens: &[u32], state: &mut InferenceState) -> Result<u32, String> {
         if state.seq_len == 0 {
             self.prefill(tokens, state)?;
-            // After prefill, the last token's hidden state is in the output buffer.
-            // The forward pass will use it as input for the first generation token.
+        } else if tokens.len() > state.seq_len as usize {
+            // (C5) Incremental prefill for multi-turn
+            let new_tokens = &tokens[state.seq_len as usize..];
+            self.prefill_incremental(new_tokens, state)?;
         }
         let token = self.forward_single(state)?;
-        // (C7) Embed token for next generation step
         self.embed_token(token, state.seq_len);
         state.seq_len += 1;
         state.position += 1;
@@ -229,6 +230,30 @@ impl InferenceEngine {
             state.hidden_ping = !state.hidden_ping;
         }
         state.kv_cache_filled = M;
+        Ok(())
+    }
+
+    /// (C5) Incremental prefill: process new tokens, reuse existing KV cache.
+    fn prefill_incremental(&mut self, new_tokens: &[u32], state: &mut InferenceState)
+        -> Result<(), String> {
+        let start = state.seq_len;
+        for (i, &tid) in new_tokens.iter().enumerate() {
+            let pos = start + i as u32;
+            self.embed_token(tid, pos);
+            state.position = pos;
+            state.hidden_ping = true; // forward_single starts from ping
+            // Run one token through all layers (appends to KV cache)
+            for layer in 0..self.weights.num_layers {
+                let is_gqa = layer % 4 == 3;
+                self.record_and_submit_layer(layer, is_gqa, 1, state)?;
+                self.record_and_submit_router(layer, 1)?;
+                let routing = self.do_route(1);
+                self.record_and_submit_moe(layer, &routing, 1)?;
+                state.hidden_ping = !state.hidden_ping;
+            }
+        }
+        state.seq_len = start + new_tokens.len() as u32;
+        state.kv_cache_filled = state.seq_len;
         Ok(())
     }
 
