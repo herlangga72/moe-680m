@@ -484,6 +484,9 @@ impl InferenceEngine {
         let use_fused = M == 1
             && self.pipelines.pipelines[PipelineType::FusedRmsNormQkvRope as usize] != vk::Pipeline::null()
             && self.pipelines.pipelines[PipelineType::AttnResidual as usize] != vk::Pipeline::null();
+        let use_dn_fused = M == 1
+            && self.pipelines.pipelines[PipelineType::FusedRmsNormDnQkv as usize] != vk::Pipeline::null()
+            && self.pipelines.pipelines[PipelineType::DnOutputResidual as usize] != vk::Pipeline::null();
 
         if is_gqa && use_fused {
             // ── Fused generation path: RMS norm + QKV GEMM + RoPE ──
@@ -609,6 +612,38 @@ impl InferenceEngine {
             pc.M = M; pc.N = hidden; pc.K = hidden;
             self.push(cmd, &pc);
             unsafe { dev.cmd_dispatch(cmd, self.div64(M), self.div8(hidden), 1); }
+        } else if use_dn_fused {
+            // ── Fused DeltaNet: RMS norm + QKV GEMM ──
+            self.bind_pipe(cmd, PipelineType::FusedRmsNormDnQkv);
+            pc.input_offset = hi;  // read hidden directly (fused norm)
+            pc.weights_offset = self.weights.attn_q[layer as usize];
+            pc.output_offset = tmp + M as u64 * hidden as u64 * 2;
+            pc.M = 1; pc.N = 4128; pc.K = hidden;
+            self.push(cmd, &pc);
+            unsafe { dev.cmd_dispatch(cmd, 1, 516, 1); }
+            self.barrier(cmd);
+
+            // ── DeltaNet Step ── (recurrent, can't fuse)
+            self.bind_pipe(cmd, PipelineType::DeltaNetStep);
+            let state_off = self.layout.deltanet_state_base;
+            pc.input_offset = tmp + M as u64 * hidden as u64 * 2;
+            pc.weights_offset = state_off;
+            pc.output_offset = state_off;
+            pc.num_qk_heads = 16; pc.num_v_heads = 32; pc.layer_idx = layer;
+            self.push(cmd, &pc);
+            unsafe { dev.cmd_dispatch(cmd, 16, 32, 1); }
+            self.barrier(cmd);
+
+            // ── Fused DeltaNet output + residual ──
+            self.bind_pipe(cmd, PipelineType::DnOutputResidual);
+            pc = PushConstants::default();
+            pc.input_offset = tmp + M as u64 * hidden as u64 * 2;
+            pc.weights_offset = self.weights.attn_output[layer as usize];
+            pc.output_offset = ho;
+            pc.M = 1; pc.N = hidden; pc.K = 4096;
+            pc.routing_weights_off = hi;  // residual
+            self.push(cmd, &pc);
+            unsafe { dev.cmd_dispatch(cmd, self.div64(1), self.div8(hidden), 1); }
         } else {
             // ── DeltaNet QKV: tmp(norm) → tmp + hidden*2 ──
             self.bind_pipe(cmd, PipelineType::DeltaNetQkv);
@@ -642,8 +677,8 @@ impl InferenceEngine {
         self.barrier(cmd);
 
         // ── (M1) Residual Add: hi + out_off → ho ──
-        // Skiped for fused path (AttnResidual already adds residual)
-        if !(is_gqa && use_fused) {
+        // Skip for fused paths (AttnResidual / DnOutputResidual already add residual)
+        if !((is_gqa && use_fused) || use_dn_fused) {
             self.bind_pipe(cmd, PipelineType::ResidualAdd);
         pc.input_offset = hi;       // original input (residual)
         pc.weights_offset = out_off; // GEMM output

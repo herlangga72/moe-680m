@@ -1,0 +1,78 @@
+// ── dn_output_residual: fused DeltaNet output GEMM + residual add ──
+// Eliminates intermediate write/read between DN output and residual.
+// Dispatch: (div64(M), div8(hidden), 1).
+// Reads QKV buffer at input_offset (4128 elems), GEMM with K=4096 → hidden.
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset;     // QKV buffer (f16, 4128 elems)
+    uint64_t weights_offset;   // DN output weight (IQ4_XS)
+    uint64_t output_offset;    // final output (f16, hidden elems)
+    uint M; uint N; uint K; uint _upad0;
+    uint64_t residual_offset;  // previous hidden state (f16)
+    uint _upad1[5]; float scale_factor;
+} pc;
+
+#include "common.glsl"
+
+const uint DN_OUTPUT_K = 4096;  // GEMM K-dim = QK elements consumed
+shared float At[64][33];
+shared float Bt[32][8];
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+void main() {
+    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;
+    uint batch = gl_GlobalInvocationID.x, oc = gl_GlobalInvocationID.y * 8;
+    uint m0 = batch * 64 + tx * 2, n0 = oc + ty * 2;
+    float a00=0,a01=0,a10=0,a11=0;
+
+    for (uint k = 0; k < DN_OUTPUT_K; k += 32) {
+        // Load At from QKV buffer (stride = 4128 elems/token, not pc.N)
+        for (uint r = 0; r < 2; r++) for (uint c = 0; c < 8; c++) {
+            uint mr = tx*2+r, mc = ty*8+c;
+            if (m0+r < pc.M && k+mc < DN_OUTPUT_K) {
+                uint64_t a = pc.input_offset + ((m0+r)*4128u + k + mc) * 2;
+                uint w = data[uint(a>>2)];
+                At[mr][mc] = f16_to_f32((w>>(uint(a&3)*8))&0xFFFF);
+            } else At[mr][mc] = 0;
+        }
+        barrier();
+
+        // Load Bt from IQ4_XS weights: weight[N][K], element at (k+tx)*N + oc+nc
+        for (uint off = 0; off < 8; off += 4) {
+            uint nc = ty + off;
+            if (k+tx < DN_OUTPUT_K && oc+nc < pc.N) {
+                Bt[tx][nc] = dequant_iq4_xs(pc.weights_offset, (k+tx)*pc.N + oc+nc);
+            } else Bt[tx][nc] = 0;
+        }
+        barrier();
+
+        for (uint kk = 0; kk < 32; kk++) {
+            float a0=At[tx*2+0][kk], a1=At[tx*2+1][kk];
+            float b0=Bt[kk][ty*2+0], b1=Bt[kk][ty*2+1];
+            a00+=a0*b0; a01+=a0*b1; a10+=a1*b0; a11+=a1*b1;
+        }
+        barrier();
+    }
+
+    // Write output with residual add
+    for (uint r = 0; r < 2; r++) for (uint c = 0; c < 2; c++) {
+        uint mi = m0+r, ni = n0+c;
+        if (mi >= pc.M || ni >= pc.N) continue;
+        float v = r==0?(c==0?a00:a01):(c==0?a10:a11);
+
+        uint64_t ra = pc.residual_offset + (uint64_t(mi)*pc.N + ni) * 2;
+        uint rw = data[uint(ra>>2)];
+        float rv = f16_to_f32((rw>>(uint(ra&3)*8))&0xFFFF);
+        float result = v + rv;
+
+        uint f16 = f32_to_f16(result);
+        uint64_t oa = pc.output_offset + (uint64_t(mi)*pc.N + ni) * 2;
+        uint wi = uint(oa>>2), sh = uint(oa&3)*8;
+        data[wi] = (data[wi]&~(0xFFFFu<<sh))|(f16<<sh);
+    }
+}

@@ -1,0 +1,90 @@
+// ── rms_norm_dn_qkv: fused RMS norm + DeltaNet QKV ──
+// Eliminates RMS norm write + re-read before DeltaNet QKV.
+// Dispatch: (div64(M), div8(4128), 1) — M=1 only (generation).
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset;     // hidden state (f16)
+    uint64_t weights_offset;   // DeltaNet QKV weight (IQ4_XS)
+    uint64_t output_offset;    // QKV output (f16, 4128 elems)
+    uint M; uint N; uint K; uint _upad0;
+    uint64_t _u1; uint _upad1[6];
+} pc;
+
+#include "common.glsl"
+
+const uint DN_QKV_ELEMS = 4128;
+shared float norm_in[2048];
+shared float red[128];
+shared float Bt[32][8];
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+void main() {
+    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;
+    uint tid = tx + ty * 32;
+    uint batch = gl_GlobalInvocationID.x;
+    uint oc = gl_GlobalInvocationID.y * 8;
+
+    if (batch >= pc.M) return;
+
+    // ── Phase 1: RMS Norm ──
+    uint64_t base = pc.input_offset + uint64_t(batch) * uint64_t(pc.K) * 2;
+    float sum_sq = 0.0;
+    for (uint i = tid; i < pc.K; i += 128) {
+        uint64_t a = base + uint64_t(i) * 2;
+        uint w = data[uint(a >> 2)];
+        float v = f16_to_f32((w >> (uint(a & 3) * 8)) & 0xFFFF);
+        sum_sq += v * v;
+        norm_in[i] = v;
+    }
+    red[tid] = sum_sq;
+    barrier();
+    for (uint s = 64; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    float rms = sqrt(red[0] / float(pc.K) + 1e-6);
+    for (uint i = tid; i < pc.K; i += 128) {
+        norm_in[i] /= rms;
+    }
+    barrier();
+
+    // ── Phase 2: DeltaNet QKV GEMM ──
+    float a00=0,a01=0,a10=0,a11=0;
+    uint m0 = batch * 64 + tx * 2, n0 = oc + ty * 2;
+
+    for (uint k = 0; k < pc.K; k += 32) {
+        for (uint off = 0; off < 8; off += 4) {
+            uint nc = ty + off;
+            if (k + tx < pc.K && oc + nc < DN_QKV_ELEMS) {
+                Bt[tx][nc] = dequant_iq4_xs(pc.weights_offset, (k + tx) * DN_QKV_ELEMS + oc + nc);
+            } else Bt[tx][nc] = 0;
+        }
+        barrier();
+
+        for (uint kk = 0; kk < 32; kk++) {
+            float a_norm = norm_in[k + kk];
+            float b0 = Bt[kk][ty * 2 + 0];
+            float b1 = Bt[kk][ty * 2 + 1];
+            a00 += a_norm * b0;
+            a01 += a_norm * b1;
+            a10 += a_norm * b0;
+            a11 += a_norm * b1;
+        }
+        barrier();
+    }
+
+    for (uint r = 0; r < 2; r++) for (uint c = 0; c < 2; c++) {
+        uint mi = m0 + r, ni = n0 + c;
+        if (mi >= pc.M || ni >= DN_QKV_ELEMS) continue;
+        float v = r == 0 ? (c == 0 ? a00 : a01) : (c == 0 ? a10 : a11);
+        uint f16 = f32_to_f16(v);
+        uint64_t oa = pc.output_offset + (uint64_t(mi) * DN_QKV_ELEMS + ni) * 2;
+        uint wi = uint(oa >> 2), sh = uint(oa & 3) * 8;
+        data[wi] = (data[wi] & ~(0xFFFFu << sh)) | (f16 << sh);
+    }
+}
