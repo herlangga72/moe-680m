@@ -1,0 +1,100 @@
+// ── GQA Flash Attention with Q4_0 KV cache ──
+// Dispatch: (M, 16, 1) — 1 TG per (token × Q head)
+// 16 Q heads, 2 KV heads (8:1), head_dim=256, TILE_KV=32
+// Online softmax with tree reduction across 256 threads
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset; uint64_t weights_offset; uint64_t output_offset;
+    uint M; uint N; uint K; uint num_experts;
+    uint64_t _u; uint _upad[6];
+} pc;
+
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+shared float K_tile[32];  // K[32 dims] per KV tile step (256 threads × 1 score)
+shared float V_tile[32];  // V[32 dims] for accumulation
+shared float score_buf[32]; // scores for this tile
+shared float exp_buf[32];   // exp(score - m_new)
+shared float red[256];      // reduction buffer
+shared float sm;             // broadcast m from thread 0
+shared float sd;             // broadcast d from thread 0
+shared float s_rescale;      // exp(m_old - m_new) rescale factor
+shared float s_exp;          // exp(score - m_new) for this position
+
+void main() {
+    uint tok = gl_GlobalInvocationID.x;
+    uint q_head = gl_GlobalInvocationID.y;
+    if (tok >= pc.M || q_head >= 16) return;
+
+    uint tid = gl_LocalInvocationIndex; // 0..255
+    uint kv_head = q_head / 8; // GQA: heads 0-7 use KV=0, heads 8-15 use KV=1
+
+    uint64_t q_base = pc.input_offset + uint64_t(tok * 16 * 256 + q_head * 256) * 2;
+    uint seq_len = pc.K;
+    uint max_seq = pc.N;
+
+    // Each thread stores its Q element
+    uint64_t qa = q_base + tid * 2;
+    uint qw = data[uint(qa>>2)];
+    float Q = f16_to_f32((qw>>(uint(qa&3)*8))&0xFFFF);
+
+    // Online softmax
+    float m = -1e20, d = 0.0, acc = 0.0;
+
+    for (uint kv = 0; kv < seq_len; kv += 32) {
+        uint tile = min(seq_len - kv, 32u);
+
+        // ── Load K tile (32 KV positions × 256 dims, but we process dim-by-dim) ──
+        // Each thread loads K[pos][tid] from Q4_0 cache for its dim
+        // Then we compute score = Σ Q[dim] × K[pos][dim] via tree reduction
+
+        // For each position in the tile, compute dot product
+        for (uint p = 0; p < tile; p++) {
+            // Load K value at position kv+p
+            float k_val = read_kv_q4_0(pc.weights_offset, max_seq, kv + p, kv_head * 256 + tid);
+            // Partial product (each thread has one dim)
+            red[tid] = Q * k_val;
+            barrier();
+
+            // Tree reduction
+            for (uint s = 128; s > 0; s >>= 1) {
+                if (tid < s) red[tid] += red[tid + s];
+                barrier();
+            }
+            float score = red[0]; // broadcast
+
+            if (tid == 0) {
+                float new_m = max(m, score);
+                float rescale = exp(m - new_m);
+                d = d * rescale + exp(score - new_m);
+                m = new_m;
+                s_rescale = rescale;
+                s_exp = exp(score - new_m);
+                sm = m;
+                sd = d;
+            }
+            barrier();
+
+            // All threads: acc = acc * rescale + exp(score - m_new) * V
+            acc = acc * s_rescale;
+            float v_val = read_kv_q4_0(pc.weights_offset, max_seq, kv + p, 512 + kv_head * 256 + tid);
+            acc += s_exp * v_val;
+        }
+    }
+
+    // Normalize (sd broadcast from thread 0, valid for all threads)
+    float result = (sd > 0) ? (acc / sd) : 0.0;
+
+    // Write f16 output
+    uint64_t oa = pc.output_offset + uint64_t(tok * 16 * 256 + q_head * 256 + tid) * 2;
+    uint f16 = f32_to_f16(result);
+    uint wi = uint(oa>>2), sh = uint(oa&3)*8;
+    data[wi] = (data[wi]&~(0xFFFFu<<sh))|(f16<<sh);
+}

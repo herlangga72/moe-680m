@@ -1,0 +1,52 @@
+// ── MoE combine: weighted sum of 9 expert outputs + residual ──
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset; uint64_t weights_offset; uint64_t output_offset;
+    uint M; uint N; uint K; uint num_experts;
+    uint64_t routing_weights_off; uint num_qk_heads; uint num_v_heads;
+    uint layer_idx; uint _pad1; uint64_t token_ids_off; float scale_factor;
+} pc;
+
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint tok = gl_GlobalInvocationID.x;
+    uint c = gl_LocalInvocationIndex;
+    if (tok >= pc.M || c >= pc.N) return;
+
+    // Read residual (input at input_offset)
+    uint64_t rb = pc.input_offset + uint64_t(tok * pc.N + c) * 2;
+    uint rw = data[uint(rb>>2)];
+    float sum = f16_to_f32((rw>>(uint(rb&3)*8))&0xFFFF);
+
+    // Add each expert's weighted contribution
+    // Expert outputs are at weights_offset + expert_id * M * N * 2
+    // Routing weights at routing_weights_off[expert_id]
+    for (uint e = 0; e < pc.num_experts; e++) {
+        uint64_t ew = pc.routing_weights_off + uint64_t(e) * 4;
+        uint ww = data[uint(ew>>2)];
+        float w = uintBitsToFloat(ww);
+
+        uint64_t eb = pc.weights_offset + uint64_t(e * pc.M * pc.N + tok * pc.N + c) * 2;
+        uint ed = data[uint(eb>>2)];
+        float ev = f16_to_f32((ed>>(uint(eb&3)*8))&0xFFFF);
+
+        sum += ev * w;
+    }
+
+    // Write to output (hidden_states + residual)
+    sum = sum / float(pc.num_experts); // normalize
+
+    uint f16 = f32_to_f16(sum);
+
+    uint64_t oa = pc.output_offset + uint64_t(tok * pc.N + c) * 2;
+    uint wi=uint(oa>>2),sh=uint(oa&3)*8;
+    data[wi]=(data[wi]&~(0xFFFFu<<sh))|(f16<<sh);
+}

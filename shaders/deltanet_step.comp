@@ -1,0 +1,111 @@
+// ── DeltaNet state update: S = gate·S + (1-gate)·outer(k,v) ──
+// Per head pair (QK head × V head), state S is 128×128 f32
+// Dispatch: (16 QK heads, 32 V heads, 1)
+// Each TG: 128 threads, handles one QK×V head pair
+// Each thread: handles one row of S
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset; uint64_t weights_offset; uint64_t output_offset;
+    uint M; uint N; uint K; uint num_experts;
+    uint64_t routing_weights_off; uint num_qk_heads; uint num_v_heads;
+    uint layer_idx; uint _pad1; uint64_t token_ids_off; float scale_factor;
+} pc;
+
+#include "common.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// QKV input layout per head pair: q[128] + k[128] + v[128] + gate(f32)
+// Total per head pair: 128+128+128+1 = 385 f32 = 1540 bytes
+// QKV at input_offset: [q for all 16] [k for all 16] [v for all 32] [gate for 32]
+// We need to locate our specific head pair's data
+
+shared float sv[128];  // v vector for this head pair (loaded cooperatively)
+
+void main() {
+    uint qkh = gl_GlobalInvocationID.x; // 0..15
+    uint vh = gl_GlobalInvocationID.y;  // 0..31
+    if (qkh >= pc.num_qk_heads || vh >= pc.num_v_heads) return;
+
+    uint row = gl_LocalInvocationIndex; // 0..127 (row of S)
+
+    uint64_t q_base = pc.input_offset;
+    uint64_t state_base = pc.weights_offset + uint64_t(pc.layer_idx) * 16 * 32 * 128 * 128 * 4;
+
+    // Locate this head pair's data in QKV output:
+    // Q[16×128] at offset 0
+    // K[16×128] at offset 16×128×4
+    // V[32×128] at offset 32×128×4
+    // G[32]     at offset 64×128×4  (wait, Q+K+V = 16+16+32 = 64 heads × 128 = 8192 f32 total)
+
+    // Q: 16 QK heads × 128 dim × 4B = 8192 bytes = at offset 0 + qkh*128*4
+    // K: 16 QK heads × 128 dim × 4B = 8192 bytes = at offset 8192 + qkh*128*4
+    // V: 32 V heads × 128 dim × 4B = 16384 bytes = at offset 16384 + vh*128*4
+    // G: 32 V heads × 4B = 128 bytes = at offset 32768 + vh*4
+
+    uint64_t q_off = q_base + qkh * 128 * 4 + row * 4;
+    uint64_t k_off = q_base + 16*128*4 + qkh * 128 * 4 + row * 4;
+    uint64_t v_off = q_base + 32*128*4 + vh * 128 * 4 + row * 4;
+
+    // Read q[row], k[row] for this thread
+    uint64_t kq = k_off; // same offset structure
+    float k_val = uintBitsToFloat(data[uint(k_off>>2)]);
+    float q_val = uintBitsToFloat(data[uint(q_off>>2)]);
+
+    // Cooperative: thread row loads V[row]
+    sv[row] = uintBitsToFloat(data[uint(v_off>>2)]);
+    barrier(); // all v values loaded
+
+    // Read gate for this V head
+    uint64_t g_off = q_base + 64*128*4 + vh * 4;
+    float gate = uintBitsToFloat(data[uint(g_off>>2)]);
+    float one_minus_gate = 1.0 - gate;
+
+    // State base for this head pair: [qkh][vh] = layer * 16*32*128*128 + qkh*32*128*128 + vh*128*128
+    // Actually: state is flat [layer][qkh][vh][128][128]
+    uint64_t hp_off = state_base + qkh * 32 * 128 * 128 * 4 + vh * 128 * 128 * 4;
+    // S[row][col] is at hp_off + row*128*4 + col*4
+
+    // Update S row by row: for this row, for each col 0..127
+    // S[row][col] = gate * S[row][col] + (1-gate) * k[row] * v[col]
+    // Load S row in chunks, update, write back
+    for (uint c = 0; c < 128; c += 32) {
+        uint64_t s_off = hp_off + row * 128 * 4 + c * 4;
+
+        // Load 32 elements of S[row][c..c+31]
+        // Each thread reads 32 consecutive floats (1 word each) — fine
+        for (uint cc = 0; cc < 32; cc++) {
+            uint wi = uint((s_off + cc*4)>>2);
+            float s_val = uintBitsToFloat(data[wi]);
+            float new_s = gate * s_val + one_minus_gate * k_val * sv[c + cc];
+            data[wi] = floatBitsToUint(new_s);
+        }
+    }
+
+    // Read gate for the output — actually the same gate scales the output
+    barrier();
+
+    // Output: o[row] = Σ S[row][j] × q[j] for j in 0..127
+    // This is 128 multiply-adds per row. Each thread does its row.
+    float o_val = 0.0;
+    for (uint j = 0; j < 128; j++) {
+        uint64_t s_off = hp_off + row * 128 * 4 + j * 4;
+        float s_val = uintBitsToFloat(data[uint(s_off>>2)]);
+        // Need q[j] for all j — this requires all q values
+        // We only have q[row] locally. Need shared q array.
+        // Simplified: read from global again
+        uint64_t qj_off = q_base + qkh * 128 * 4 + j * 4;
+        float qj = uintBitsToFloat(data[uint(qj_off>>2)]);
+        o_val += s_val * qj;
+    }
+
+    // Write output: V_head × 128 dims, at output_offset
+    // Output is for the output projection: 32 V heads × 128 dim = 4096 elements
+    uint64_t oa = pc.output_offset + vh * 128 * 4 + row * 4;
+    data[uint(oa>>2)] = floatBitsToUint(o_val);
+}

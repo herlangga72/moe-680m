@@ -1,0 +1,60 @@
+// ── RMS normalization ──
+// Dispatch: (M, 1, 1) — one threadgroup per token
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+
+layout(push_constant) uniform PC {
+    uint64_t input_offset; uint64_t weights_offset; uint64_t output_offset;
+    uint M; uint N; uint K; uint num_experts;
+    uint64_t routing_weights_off; uint num_qk_heads; uint num_v_heads;
+    uint layer_idx; uint _pad1; uint64_t token_ids_off; float scale_factor;
+} pc;
+
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+shared float ssum[256];
+
+void main() {
+    uint tok = gl_GlobalInvocationID.x;
+    if (tok >= pc.M) return;
+
+    uint64_t base = pc.input_offset + uint64_t(tok) * uint64_t(pc.K);
+    uint tidx = gl_LocalInvocationIndex;
+
+    // Sum of squares
+    float sum_sq = 0.0;
+    for (uint i = tidx; i < pc.K; i += 256) {
+        uint64_t a = base + uint64_t(i) * 2;
+        uint w = data[uint(a >> 2)];
+        float v = f16_to_f32((w >> (uint(a & 3) * 8)) & 0xFFFF);
+        sum_sq += v * v;
+    }
+    ssum[tidx] = sum_sq;
+    barrier();
+
+    // Tree reduction
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tidx < s) ssum[tidx] += ssum[tidx + s];
+        barrier();
+    }
+    float rms = sqrt(ssum[0] / float(pc.K) + 1e-6);
+
+    // Normalize
+    for (uint i = tidx; i < pc.K; i += 256) {
+        uint64_t a = base + uint64_t(i) * 2;
+        uint w = data[uint(a >> 2)];
+        float v = f16_to_f32((w >> (uint(a & 3) * 8)) & 0xFFFF);
+        float result = v / rms;
+
+        uint f16 = f32_to_f16(result);
+        uint64_t oa = pc.output_offset + uint64_t(tok) * uint64_t(pc.K) + uint64_t(i) * 2;
+        uint wi = uint(oa>>2), sh = uint(oa&3)*8;
+        data[wi] = (data[wi]&~(0xFFFFu<<sh))|(f16<<sh);
+    }
+}

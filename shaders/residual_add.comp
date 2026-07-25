@@ -1,0 +1,41 @@
+// ── Residual add: output = input + gemm_result (element-wise f16) ──
+// input at input_offset (the pre-MoE/attention hidden state)
+// gemm_result at weights_offset (the output projection result)
+// output at output_offset (the next layer's input buffer)
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset; uint64_t weights_offset; uint64_t output_offset;
+    uint M; uint N; uint K; uint num_experts;
+    uint64_t _u; uint _upad[6];
+} pc;
+
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint tok = gl_GlobalInvocationID.x;
+    uint i = gl_LocalInvocationIndex;
+    if (tok >= pc.M || i >= pc.N) return;
+
+    uint64_t in_addr = pc.input_offset + uint64_t(tok * pc.N + i) * 2;
+    uint64_t gw_addr = pc.weights_offset + uint64_t(tok * pc.N + i) * 2;
+    uint64_t out_addr = pc.output_offset + uint64_t(tok * pc.N + i) * 2;
+
+    uint iw = data[uint(in_addr>>2)], igs = uint(in_addr&3)*8;
+    float inv = f16_to_f32((iw>>igs)&0xFFFF);
+
+    uint gw = data[uint(gw_addr>>2)], ggs = uint(gw_addr&3)*8;
+    float gv = f16_to_f32((gw>>ggs)&0xFFFF);
+
+    float result = inv + gv;
+
+    uint f16 = f32_to_f16(result);
+    uint wi=uint(out_addr>>2), sh=uint(out_addr&3)*8;
+    data[wi] = (data[wi]&~(0xFFFFu<<sh)) | (f16<<sh);
+}

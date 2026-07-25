@@ -1,0 +1,41 @@
+// ── SiLU gate activation: scratch = silu(gate) * up ──
+// Input: scratch[0..inter) = gate, scratch[inter..2*inter) = up
+// Output: scratch[0..inter) = silu(gate) * up
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset; uint64_t weights_offset; uint64_t output_offset;
+    uint M; uint N; uint K; uint num_experts;
+    uint64_t _u; uint _upad[6];
+} pc;
+
+#include "common.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint t = gl_GlobalInvocationID.x, i = gl_LocalInvocationIndex;
+    if (t >= pc.M || i >= pc.N) return;
+
+    // Read gate value
+    uint64_t ga = pc.input_offset + uint64_t(t * pc.N * 2 + i) * 2;
+    uint gw = data[uint(ga>>2)];
+    float gate = f16_to_f32((gw>>(uint(ga&3)*8))&0xFFFF);
+
+    // Read up value (at offset + N from gate)
+    uint64_t ua = pc.input_offset + uint64_t(t * pc.N * 2 + pc.N + i) * 2;
+    uint uw = data[uint(ua>>2)];
+    float up = f16_to_f32((uw>>(uint(ua&3)*8))&0xFFFF);
+
+    float result = silu(gate) * up;
+
+    // Write back to gate position (reuse scratch)
+    uint f16 = f32_to_f16(result);
+    uint64_t oa = pc.output_offset + uint64_t(t * pc.N * 2 + i) * 2;
+    uint wi = uint(oa>>2), sh = uint(oa&3)*8;
+    data[wi] = (data[wi]&~(0xFFFFu<<sh))|(f16<<sh);
+}

@@ -1,0 +1,71 @@
+// ── KV cache write: quantize K/V to Q4_0 ──
+// Input: Q[4096]+K[512]+V[512] f16 per token at input_offset
+// Output: Q4_0 blocks at weights_offset
+//   K: [pos * 16 + blk] × 18 bytes each (16 blocks × 18B = 288B per token)
+//   V: at max_seq_len * 288 bytes after K start
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset; uint64_t weights_offset; uint64_t output_offset;
+    uint M; uint N; uint K; uint num_experts;
+    uint64_t routing_weights_off; uint num_qk_heads; uint num_v_heads;
+    uint layer_idx; uint _pad1; uint64_t token_ids_off; float scale_factor;
+} pc;
+
+#include "common.glsl"
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+shared float sv[32];
+
+// Q4_0 block write: sv[0..31] → 18 bytes at dst
+void write_q4_0(uint64_t dst) {
+    barrier();
+    if (gl_LocalInvocationIndex == 0) {
+        float amax = 0.0; for (uint i = 0; i < 32; i++) if (abs(sv[i]) > amax) amax = abs(sv[i]);
+        float d = amax / 7.0; if (d < 1e-10) d = 1.0;
+        uint f16 = f32_to_f16(d);
+        uint wi = uint(dst>>2), sh = uint(dst&3)*8;
+        data[wi] = (data[wi] & ~(0xFFFFu<<sh)) | (f16<<sh);
+    }
+    barrier();
+    float d = f16_to_f32((data[uint(dst>>2)]>>(uint(dst&3)*8))&0xFFFF);
+    barrier();
+    uint i = gl_LocalInvocationIndex;
+    int q = int(round(sv[i] / d)) + 8; if (q < 0) q = 0; if (q > 15) q = 15;
+    if ((i & 1) == 0) {
+        uint64_t ba = dst + 2 + (i >> 1);
+        uint bw = uint(ba>>2), bs = uint(ba&3)*8;
+        data[bw] = (data[bw] & ~(0xFu << bs)) | (uint(q) << bs);
+    }
+    barrier();
+    if ((i & 1) == 1) {
+        uint64_t ba = dst + 2 + (i >> 1);
+        uint bw = uint(ba>>2), bs = uint(ba&3)*8;
+        data[bw] = (data[bw] & ~(0xFu << (bs+4))) | (uint(q) << (bs+4));
+    }
+}
+
+void main() {
+    uint t = gl_GlobalInvocationID.x, b = gl_GlobalInvocationID.y;
+    if (t >= pc.M || b >= 32) return;
+    uint i = gl_LocalInvocationIndex, blk = b & 15;
+    uint64_t kc = pc.weights_offset;
+    uint64_t vc = pc.weights_offset + uint64_t(pc.N) * 288;
+    uint pos = pc.K;
+
+    if (b < 16) { // K block blk
+        uint64_t src = pc.input_offset + uint64_t(t * 5120 + 4096 + blk * 32 + i) * 2;
+        uint w = data[uint(src>>2)];
+        sv[i] = f16_to_f32((w>>(uint(src&3)*8))&0xFFFF);
+        write_q4_0(kc + uint64_t((pos + t) * 16 + blk) * 18);
+    } else { // V block blk
+        uint64_t src = pc.input_offset + uint64_t(t * 5120 + 4608 + blk * 32 + i) * 2;
+        uint w = data[uint(src>>2)];
+        sv[i] = f16_to_f32((w>>(uint(src&3)*8))&0xFFFF);
+        write_q4_0(vc + uint64_t((pos + t) * 16 + blk) * 18);
+    }
+}

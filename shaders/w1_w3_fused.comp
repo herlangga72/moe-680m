@@ -1,0 +1,72 @@
+// ── w1_w3_fused: MoE gate+up, RDNA2 optimized ──
+// TG 32×4 (128 threads = 4 waves @ wave32), coverage 64 M × 8 N, TILE_K=32
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset; uint64_t weights_offset; uint64_t output_offset;
+    uint M; uint N; uint K; uint num_experts;
+    uint64_t routing_weights_off; uint num_qk_heads; uint num_v_heads;
+    uint layer_idx; uint _pad1; uint64_t token_ids_off; float scale_factor;
+} pc;
+
+#include "common.glsl"
+
+shared float At[64][32];  // 64 M × 32 K-tile = 8 KB
+shared float Bt[32][8];    // 32 K × 8 N-tile = 1 KB
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+void main() {
+    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;
+    uint batch = gl_GlobalInvocationID.x, out_c = gl_GlobalInvocationID.y * 8;
+    uint m0 = batch * 64 + tx * 2, n0 = out_c + ty * 2, hn = pc.N / 2;
+    float a00=0,a01=0,a10=0,a11=0;
+
+    for (uint k = 0; k < pc.K; k += 32) {
+        // Load At: 128 threads cover 64×32 = 2048 elements, 16 per thread
+        // Each thread: tx*2..tx*2+1 (2 M-rows), ty*8..ty*8+7 (8 K-cols)
+        for (uint r = 0; r < 2; r++) for (uint c = 0; c < 8; c++) {
+            uint mr = tx*2 + r, mc = ty*8 + c;
+            if (m0+r < pc.M && k+mc < pc.K) {
+                uint64_t a = pc.input_offset + ((m0+r)*pc.K + k + mc) * 2;
+                uint w = data[uint(a>>2)];
+                At[mr][mc] = f16_to_f32((w>>(uint(a&3)*8))&0xFFFF);
+            } else At[mr][mc] = 0;
+        }
+        barrier();
+
+        // Load Bt: 128 threads cover 32×8 = 256 elements, 2 per thread
+        // Each thread: Bt[tx][ty] and Bt[tx][ty+4] — covers all 8 N-cols
+        for (uint off = 0; off < 8; off += 4) {
+            uint nc = ty + off;
+            if (k+tx < pc.K && out_c+nc < pc.N) {
+                uint n_idx = out_c + nc;
+                uint64_t wb = (n_idx < hn) ? pc.weights_offset : pc.routing_weights_off;
+                Bt[tx][nc] = dequant_iq4_xs(wb, (k+tx)*hn + (n_idx % hn));
+            } else Bt[tx][nc] = 0;
+        }
+        barrier();
+
+        // 2×2 MAC
+        for (uint kk = 0; kk < 32; kk++) {
+            float a0=At[tx*2+0][kk], a1=At[tx*2+1][kk];
+            float b0=Bt[kk][ty*2+0], b1=Bt[kk][ty*2+1];
+            a00+=a0*b0; a01+=a0*b1; a10+=a1*b0; a11+=a1*b1;
+        }
+        barrier();
+    }
+
+    for (uint r = 0; r < 2; r++) for (uint c = 0; c < 2; c++) {
+        uint mi = m0+r, ni = n0+c;
+        if (mi >= pc.M || ni >= pc.N) continue;
+        float v = r==0?(c==0?a00:a01):(c==0?a10:a11);
+        if (ni < hn) v = silu(v);
+        uint f16 = f32_to_f16(v);
+        uint64_t oa = pc.output_offset + (mi*pc.N+ni)*2;
+        uint wi = uint(oa>>2), sh = uint(oa&3)*8;
+        data[wi] = (data[wi]&~(0xFFFFu<<sh))|(f16<<sh);
+    }
+}
