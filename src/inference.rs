@@ -551,21 +551,23 @@ impl InferenceEngine {
             unsafe { dev.cmd_dispatch(cmd, self.div64(M), self.div8(4096), 1); }
             self.barrier(cmd);
 
-            // ── K projection: hidden × attn_k → tmp + hidden*2 + 4096 ──
+            // ── K projection: hidden × attn_k → tmp + hidden*2 + 4096*2 ──
+            // kv_write reads K at element offset 4096 (5120-elem stride). Must be +4096*2 bytes.
             self.bind_pipe(cmd, PipelineType::GqaQkv);
             pc.input_offset = tmp;
             pc.weights_offset = self.weights.attn_k[layer as usize];
-            pc.output_offset = tmp + M as u64 * hidden as u64 * 2 + 4096;
+            pc.output_offset = tmp + M as u64 * hidden as u64 * 2 + 4096 * 2;
             pc.M = M; pc.N = 512; pc.K = hidden; // 2 KV heads × 256 dim
             self.push(cmd, &pc);
             unsafe { dev.cmd_dispatch(cmd, self.div64(M), self.div8(512), 1); }
             self.barrier(cmd);
 
-            // ── V projection: hidden × attn_v → tmp + hidden*2 + 4096 + 512 ──
+            // ── V projection: hidden × attn_v → tmp + hidden*2 + 4608*2 ──
+            // kv_write reads V at element offset 4608. Must be +4608*2 bytes.
             self.bind_pipe(cmd, PipelineType::GqaQkv);
             pc.input_offset = tmp;
             pc.weights_offset = self.weights.attn_v[layer as usize];
-            pc.output_offset = tmp + M as u64 * hidden as u64 * 2 + 4096 + 512;
+            pc.output_offset = tmp + M as u64 * hidden as u64 * 2 + 4096 * 2 + 512 * 2;
             pc.M = M; pc.N = 512; pc.K = hidden;
             self.push(cmd, &pc);
             unsafe { dev.cmd_dispatch(cmd, self.div64(M), self.div8(512), 1); }
