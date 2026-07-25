@@ -13,47 +13,19 @@ uint read_u16(uint64_t off) {
     return lo | (hi << 8);
 }
 
-// ── f16 ↔ f32 conversion (branchless, using hardware intrinsics) ──
-// RDNA2 has native v_cvt_f32_f16 / v_cvt_pkrtz_f32_f16 instructions.
-// unpackHalf2x16 / packHalf2x16 compile to these on Vulkan + RADV.
+uint read_u32(uint64_t off) {
+    return data[uint(off >> 2)];  // dword-aligned read from byte offset
+}
+
+// ── f16 ↔ f32 conversion (native RDNA2 instructions) ──
+// unpackHalf2x16 → v_cvt_f32_f16 (1-2 instr), packHalf2x16 → v_cvt_pkrtz_f32_f16 (1 instr).
 
 float f16_to_f32(uint bits) {
-    // Branchless: compute all possible exponent/mantissa paths simultaneously
-    // and select using masks. Flushes denormals to zero (acceptable for inference).
-    uint s = (bits & 0x8000u) << 16u;
-    uint e = (bits & 0x7C00u) >> 10u;
-    uint m = bits & 0x03FFu;
-    // Normal: e + 112, mant << 13
-    // Denorm (e==0): flush to zero
-    // Inf/NaN (e==31): e = 255, mant << 13
-    uint e_norm = e + 112u;
-    uint e_clamp = (e == 31u) ? 255u : e_norm;
-    uint e_keep = (e == 0u) ? 0u : e_clamp;
-    uint m_keep = (e == 0u) ? 0u : (m << 13u);
-    uint bits32 = s | (e_keep << 23u) | m_keep;
-    return uintBitsToFloat(bits32);
+    return unpackHalf2x16(bits).x;  // lower 16 bits → f32, native speed
 }
 
 uint f32_to_f16(float v) {
-    // Branchless f32→f16 with clamp.
-    // Extract fields, compute f16 exponent with clamp, select results.
-    uint fb = floatBitsToUint(v);
-    uint s16 = (fb >> 16u) & 0x8000u;
-    int e32 = int((fb >> 23u) & 0xFFu) - 127;
-    uint m16 = (fb >> 13u) & 0x03FFu;
-    // Clamp exponent from [-127..128] to [-15..16] for f16
-    e32 = max(e32, -15);
-    e32 = min(e32, 16);
-    uint e16 = uint(e32 + 15);
-    uint f16 = s16 | (e16 << 10u) | m16;
-    // Handle edge: if original f32 is zero, output zero
-    // (all bits zero case — mantissa may have sticky bits from clamp)
-    if (fb == 0u) return 0u;
-    // Clamp to max f16 if exponent was >= 16 in f32 scale
-    // (handles overflow to infinity)
-    int orig_e32 = int((fb >> 23u) & 0xFFu) - 127;
-    if (orig_e32 >= 16) f16 = s16 | (31u << 10u);
-    return f16;
+    return packHalf2x16(vec2(v, 0.0));  // f32 → f16 in lower 16 bits, HW rounding
 }
 
 // ── IQ4_XS dequant ──
@@ -68,10 +40,9 @@ float dequant_iq4_xs(uint64_t weights_base, uint weight_idx) {
     uint block_pos = weight_idx % IQ4_BLOCK_SIZE;
     uint64_t bo = weights_base + uint64_t(block_idx) * IQ4_BLOCK_BYTES;
 
-    // Branchless d/d2 selection via select()
-    float d0 = f16_to_f32(read_u16(bo));
-    float d2 = f16_to_f32(read_u16(bo + 2));
-    float d = (block_pos < 16u) ? d0 : d2;
+    // Both f16 scales in one dword: unpackHalf2x16 extracts both via single v_cvt_f32_f16 pair
+    vec2 d_scale = unpackHalf2x16(read_u32(bo));
+    float d = (block_pos < 16u) ? d_scale.x : d_scale.y;
 
     uint ns = IQ4_QS_OFF + (block_pos >> 1);
     uint byte = read_u8(bo + uint64_t(ns));
