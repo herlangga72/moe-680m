@@ -19,7 +19,7 @@ pub fn route_cpu(logits: &[f32], num_experts: u32, num_tokens: u32) -> Vec<Routi
     results
 }
 
-fn route_single(logits: &[f32]) -> RoutingOutput {
+pub(crate) fn route_single(logits: &[f32]) -> RoutingOutput {
     // Softmax
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut probs = [0.0f32; 256];
@@ -33,11 +33,11 @@ fn route_single(logits: &[f32]) -> RoutingOutput {
         for p in &mut probs { *p *= inv; }
     }
 
-    // Top-8 selection (partial sort on stack array)
+    // Top-8 via partial sort: O(n) instead of O(n log n)
     let n = logits.len().min(256);
     let mut indices = [0usize; 256];
     for i in 0..n { indices[i] = i; }
-    indices[..n].sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+    indices[..n].select_nth_unstable_by(7, |&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
 
     let mut routed = [0u16; 8];
     let mut weights = [0.0f32; 8];

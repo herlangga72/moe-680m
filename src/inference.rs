@@ -637,7 +637,7 @@ impl InferenceEngine {
             return vec![router::RoutingOutput { routed, weights, shared_id: 0 }];
         }
 
-        // Prefill path (M > 1): CPU reads f16 logits, does softmax + batched routing
+        // Prefill path (M > 1): process tokens one at a time on stack (no alloc)
         let base = self.layout.routing_logits_base as usize;
         let n_exp = self.weights.num_experts as usize;
         if base == 0 || M == 0 { return vec![]; }
@@ -645,8 +645,16 @@ impl InferenceEngine {
             std::slice::from_raw_parts(
                 self.arena_base.add(base) as *const u16, M as usize * n_exp)
         };
-        let logits: Vec<f32> = raw.iter().map(|&f| f16_bits_to_f32(f)).collect();
-        router::route_cpu(&logits, self.weights.num_experts, M)
+        let mut results = Vec::with_capacity(M as usize);
+        for t in 0..M as usize {
+            let off = t * n_exp;
+            let mut logits = [0.0f32; 256];
+            for i in 0..n_exp {
+                logits[i] = f16_bits_to_f32(raw[off + i]);
+            }
+            results.push(router::route_single(&logits));
+        }
+        results
     }
 
     // ── MoE recording (C2: adds bind_descriptor_sets) ──
