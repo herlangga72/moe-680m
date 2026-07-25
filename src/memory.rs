@@ -17,10 +17,12 @@ pub struct ArenaLayout {
     pub kv_cache_size: u64,
     pub deltanet_state_base: u64,
     pub deltanet_state_size: u64,
-    pub scratch_base: u64,       // MoE scratch + layer compute temps (M1/M2)
-    pub temp_base: u64,          // Layer compute temp (QKV, attn output, etc.)
-    pub routing_logits_base: u64,
-    pub routing_topk_base: u64,
+    pub scratch_base: u64,            // GPU: MoE intermediate compute
+    pub temp_base: u64,               // GPU: layer compute temp (QKV, attn output)
+    pub routing_logits_base: u64,     // GPU→CPU: routing logits for prefill
+    pub routing_topk_base: u64,       // GPU→CPU: top-8 results for generation
+    pub routing_token_base: u64,      // CPU→GPU: sorted token IDs for MoE batches
+    pub routing_weight_base: u64,     // CPU→GPU: sorted routing weights for MoE batches
     pub total_size: u64,
 }
 
@@ -74,13 +76,20 @@ impl ArenaLayout {
         let routing_topk_base = off;
         off += routing_topk_size;
 
+        // CPU→GPU: per-expert batch token IDs and weights for prefill MoE dispatch
+        // Sized for max prefill batch (8192 tokens × 9 slots × 2B = 144 KB)
+        let routing_token_base = off;
+        off += align((8192u64).min(cfg.context_length as u64) * 9 * 2);
+        let routing_weight_base = off;
+        off += align((8192u64).min(cfg.context_length as u64) * 9 * 4);
+
         ArenaLayout {
             weights_base,
             hidden_ping, hidden_pong,
             kv_cache_base, kv_cache_size,
             deltanet_state_base, deltanet_state_size,
             scratch_base, temp_base, routing_logits_base,
-            routing_topk_base,
+            routing_topk_base, routing_token_base, routing_weight_base,
             total_size: off,
         }
     }

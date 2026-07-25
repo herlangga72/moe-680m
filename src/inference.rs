@@ -676,8 +676,8 @@ impl InferenceEngine {
             let (sorted_tokens, sorted_weights, ranges) =
                 router::build_expert_batches(routing, self.weights.num_experts);
             let total_slots = sorted_tokens.len() as u32;
-            let tok_base = scratch;
-            let wgt_base = scratch + 256 * 1024;
+            let tok_base = self.layout.routing_token_base;
+            let wgt_base = self.layout.routing_weight_base;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     sorted_tokens.as_ptr(),
