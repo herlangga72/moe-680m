@@ -1,0 +1,59 @@
+// ── w1_w3_fused_m1: MoE gate+up for M=1 generation ──
+// Workgroup 256 threads covers 1 M × 256 N (no M-tile waste).
+// Dispatch: (1, div256(N), 1)  — 32× fewer workgroups than the general shader for M=1.
+//
+// Input:  A[K] f16 at input_offset (K = hidden_size)
+//         W1[K][hn] IQ4_XS at weights_offset (hn = N/2 = inter)
+//         W3[K][hn] IQ4_XS at routing_weights_off
+// Output: gate[hn] + up[hn] f16 at output_offset
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset; uint64_t weights_offset; uint64_t output_offset;
+    uint M; uint N; uint K; uint num_experts;
+    uint64_t routing_weights_off; uint num_qk_heads; uint num_v_heads;
+    uint layer_idx; uint _pad1; uint64_t token_ids_off; float scale_factor;
+} pc;
+
+#include "common.glsl"
+
+shared float At[32];
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint n = gl_GlobalInvocationID.y * 256u + gl_LocalInvocationIndex;
+    uint i = gl_LocalInvocationIndex;
+    uint hn = pc.N / 2u;
+
+    float acc = 0.0;
+    for (uint k = 0u; k < pc.K; k += 32u) {
+        if (i < 32u) {
+            uint64_t a = pc.input_offset + (k + i) * 2u;
+            uint w = data[uint(a >> 2u)];
+            At[i] = f16_to_f32((w >> (uint(a & 3u) * 8u)) & 0xFFFFu);
+        }
+        barrier();
+
+        if (n < pc.N) {
+            uint n_idx = n;
+            uint64_t wb = (n_idx < hn) ? pc.weights_offset : pc.routing_weights_off;
+            uint n_mod = n_idx % hn;
+            for (uint kk = 0u; kk < 32u; kk++) {
+                acc += At[kk] * dequant_iq4_xs(wb, (k + kk) * hn + n_mod);
+            }
+        }
+        barrier();
+    }
+
+    if (n < pc.N) {
+        uint f16 = f32_to_f16(acc);
+        uint64_t oa = pc.output_offset + n * 2u;
+        uint wi = uint(oa >> 2u), sh = uint(oa & 3u) * 8u;
+        data[wi] = (data[wi] & ~(0xFFFFu << sh)) | (f16 << sh);
+    }
+}

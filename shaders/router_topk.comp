@@ -1,0 +1,94 @@
+// ── Router Top-K: softmax + top-8 selection on GPU ──
+// Softmax: data-parallel tree reductions (all 256 threads).
+// Top-8: serial insertion sort on thread 0 (fastest for 256→8,
+//         only 1 active lane on RDNA2 wave32, no divergence cost).
+// Writes 9 × 8 bytes at output_offset:
+//   entry 0 = shared (id=0, weight=1.0)
+//   entries 1..8 = top-8 routed, sorted descending
+// Each entry: { uint32 expert_id_low16, uint32 weight_f32 }
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset; uint64_t _w_off; uint64_t output_offset;
+    uint M; uint N; uint _pad[7];
+} pc;
+
+#include "common.glsl"
+
+shared float smem_vals[256];
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    uint i = gl_LocalInvocationIndex;
+    if (t >= pc.M) return;
+
+    // ── Load one logit per thread ──
+    uint64_t a = pc.input_offset + uint64_t(t * 256 + i) * 2;
+    uint w = data[uint(a >> 2)];
+    float logit = f16_to_f32((w >> (uint(a & 3) * 8)) & 0xFFFF);
+    smem_vals[i] = logit;
+    barrier();
+
+    // ── Tree max reduction (8 steps) ──
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (i < s) smem_vals[i] = max(smem_vals[i], smem_vals[i + s]);
+        barrier();
+    }
+    float max_val = smem_vals[0];
+    barrier();
+
+    // ── Exponentiate (logit preserved in register) ──
+    float e = exp(logit - max_val);
+    smem_vals[i] = e;
+    barrier();
+
+    // ── Tree sum reduction (8 steps) ──
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (i < s) smem_vals[i] += smem_vals[i + s];
+        barrier();
+    }
+    float sum = smem_vals[0];
+    barrier();
+
+    // ── Normalize ──
+    float prob = (sum > 0.0) ? (e / sum) : 0.0;
+    smem_vals[i] = prob;
+    barrier();
+
+    // ── Serial top-8 on thread 0 ──
+    // Fastest path for N=256,K=8: single lane does insertion sort.
+    // Remaining 255 threads masked at wave level — zero extra ALU cost.
+    if (i == 0u) {
+        uint ids[9]; float vals[9];
+        ids[0] = 0u; vals[0] = 1.0;
+        for (int j = 1; j < 9; j++) { ids[j] = 0u; vals[j] = -1.0; }
+
+        for (uint j = 0u; j < 256u; j++) {
+            float p = smem_vals[j];
+            for (uint k = 1u; k < 9u; k++) {
+                if (p > vals[k]) {
+                    for (uint s = 8u; s > k; s--) {
+                        ids[s] = ids[s - 1u];
+                        vals[s] = vals[s - 1u];
+                    }
+                    ids[k] = j;
+                    vals[k] = p;
+                    break;
+                }
+            }
+        }
+
+        uint64_t waddr = pc.output_offset + uint64_t(t) * 72;
+        for (int j = 0; j < 9; j++) {
+            data[uint(waddr >> 2)] = ids[j];
+            data[uint(waddr >> 2) + 1u] = floatBitsToUint(vals[j]);
+            waddr += 8u;
+        }
+    }
+}

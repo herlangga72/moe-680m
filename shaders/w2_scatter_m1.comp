@@ -1,0 +1,63 @@
+// ── w2_scatter_m1: w2 + scatter-add for M=1 generation ──
+// Workgroup 256 threads covers 1 M × 256 N. Dispatch: (1, div256(N), 1).
+// Fused SiLU: reads gate||up from W1W3 output, computes SiLU(gate)*up inline.
+//
+// Input:  gate[K] + up[K] f16 at input_offset (K = inter, [1][2K] layout)
+//         W2[K][N] IQ4_XS at weights_offset
+// Output: scatter-add to hidden[1][N] f16 at output_offset
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset; uint64_t weights_offset; uint64_t output_offset;
+    uint M; uint N; uint K; uint num_experts;
+    uint64_t _u1; uint num_qk_heads; uint num_v_heads;
+    uint layer_idx; uint _pad1; uint64_t token_ids_off; float scale_factor;
+} pc;
+
+#include "common.glsl"
+
+shared float At[32];
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint n = gl_GlobalInvocationID.y * 256u + gl_LocalInvocationIndex;
+    uint i = gl_LocalInvocationIndex;
+
+    float acc = 0.0;
+    for (uint k = 0u; k < pc.K; k += 32u) {
+        // Load SiLU(gate[k+i]) * up[k+i] into At
+        if (i < 32u) {
+            uint64_t ga = pc.input_offset + (k + i) * 2u;
+            uint gw = data[uint(ga >> 2u)];
+            float gate = f16_to_f32((gw >> (uint(ga & 3u) * 8u)) & 0xFFFFu);
+            uint64_t ua = pc.input_offset + (uint64_t(pc.K) + k + i) * 2u;
+            uint uw = data[uint(ua >> 2u)];
+            float upv = f16_to_f32((uw >> (uint(ua & 3u) * 8u)) & 0xFFFFu);
+            At[i] = silu(gate) * upv;
+        }
+        barrier();
+
+        if (n < pc.N) {
+            for (uint kk = 0u; kk < 32u; kk++) {
+                acc += At[kk] * dequant_iq4_xs(pc.weights_offset, (k + kk) * pc.N + n);
+            }
+        }
+        barrier();
+    }
+
+    // Scatter-add to hidden (tid=0 for M=1 generation)
+    if (n < pc.N) {
+        float add = acc * pc.scale_factor;
+        uint64_t oa = pc.output_offset + n * 2u;
+        uint ow = data[uint(oa >> 2u)], os = uint(oa & 3u) * 8u;
+        float exist = f16_to_f32((ow >> os) & 0xFFFFu);
+        uint f16 = f32_to_f16(exist + add);
+        uint wi = uint(oa >> 2u), sh = uint(oa & 3u) * 8u;
+        data[wi] = (data[wi] & ~(0xFFFFu << sh)) | (f16 << sh);
+    }
+}
