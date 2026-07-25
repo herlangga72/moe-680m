@@ -6,6 +6,7 @@ mod inference;
 mod router;
 mod sampling;
 mod tokenizer;
+mod util;
 #[cfg(feature = "server")]
 mod server;
 
@@ -106,12 +107,6 @@ fn run_smoke(debug: &DebugContext) {
 
 // ── Helpers to extract tokenizer data from GGUF metadata ──
 
-fn meta_get_str(meta: &std::collections::HashMap<String, gguf::MetadataValue>, key: &str) -> Option<String> {
-    meta.get(key).and_then(|v| {
-        if let gguf::MetadataValue::String(s) = v { Some(s.clone()) } else { None }
-    })
-}
-
 fn meta_get_arr_str(meta: &std::collections::HashMap<String, gguf::MetadataValue>, key: &str) -> Option<Vec<String>> {
     meta.get(key).and_then(|v| {
         if let gguf::MetadataValue::Array(arr) = v {
@@ -129,7 +124,6 @@ fn meta_get_arr_f32(meta: &std::collections::HashMap<String, gguf::MetadataValue
             let vals: Vec<f32> = arr.iter().filter_map(|x| {
                 match x {
                     gguf::MetadataValue::Float32(f) => Some(*f),
-                    gguf::MetadataValue::Float64(f) => Some(*f as f32),
                     _ => None,
                 }
             }).collect();
@@ -173,14 +167,13 @@ fn run_inference(model_path: &str, prompt_text: Option<&str>, max_tokens: u32,
     // Extract config, tensors, metadata before dropping reader
     let config = reader.config.clone();
     let tensors = reader.tensors.clone();
-    let tensor_count = reader.tensor_count;
+    let _tensor_count = reader.tensor_count;
     let tensor_data_offset = reader.tensor_data_offset;
     let meta = &reader.metadata;
 
     // (NEW) Initialize tokenizer from GGUF metadata
     eprintln!("Initializing tokenizer...");
     let tokenizer_data = match tokenizer::TokenizerData::from_gguf_meta(
-        &|k| meta_get_str(meta, k),
         &|k| meta_get_arr_str(meta, k),
         &|k| meta_get_arr_f32(meta, k),
         &|k| meta_get_int(meta, k),
@@ -217,15 +210,12 @@ fn run_inference(model_path: &str, prompt_text: Option<&str>, max_tokens: u32,
     // 6. Load weights
     let reg = memory::TensorRegistry::from_tensors(&tensors, layout.weights_base);
     unsafe {
+        memory::load_weights_from_tensors(&reader, &tensors, &reg, arena_ptr);
+        // madvise hint: no longer need GGUF mmap pages after tensor copy
         for ti in &tensors {
-            if let Some(entry) = reg.lookup(&ti.name) {
-                let src_start = (tensor_data_offset + ti.offset) as usize;
-                let src = &mmap[src_start..src_start + ti.size as usize];
-                let dst = arena_ptr.add(entry.arena_offset as usize);
-                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, ti.size as usize);
-                libc::madvise(mmap.as_ptr().add(src_start) as *mut libc::c_void,
-                    ti.size as libc::size_t, libc::MADV_DONTNEED);
-            }
+            let src_start = (tensor_data_offset + ti.offset) as usize;
+            libc::madvise(mmap.as_ptr().add(src_start) as *mut libc::c_void,
+                ti.size as libc::size_t, libc::MADV_DONTNEED);
         }
     }
     let weights = memory::LayerWeights::from_registry(&reg, &config);
@@ -263,22 +253,22 @@ fn run_inference(model_path: &str, prompt_text: Option<&str>, max_tokens: u32,
         Err(err) => { eprintln!("❌ Engine: {}", err); return; }
     };
 
-    // 10. Server mode or inference mode
-    if let Some(port) = server_port {
+    // 10. Server mode
+    if let Some(_port) = server_port {
         #[cfg(feature = "server")]
         {
+            let port = _port;
             use std::sync::Mutex;
-            let srv = server::Server::new("127.0.0.1", port);
             eprintln!("Starting server on :{}", port);
-            srv.run(config, tokenizer, Mutex::new(engine));
-            // Server blocks; never returns
+            server::serve("127.0.0.1", port, tokenizer, Mutex::new(engine));
+            return;
         }
         #[cfg(not(feature = "server"))]
         {
-            eprintln!("Server feature not enabled. Build with: cargo build --features server");
+            eprintln!("Server not enabled. Build with: cargo build --features server");
             unsafe { engine.device.device.free_memory(arena_mem, None); }
+            return;
         }
-        return;
     }
 
     // 11. CLI inference mode
@@ -287,26 +277,32 @@ fn run_inference(model_path: &str, prompt_text: Option<&str>, max_tokens: u32,
         let input_ids = tokenizer.encode(prompt_text);
         eprintln!("Tokenized: {} tokens", input_ids.len());
 
+        engine.sampling_params.max_tokens = max_tokens;
+        engine.reset_sampling();
+
+        // Prepend BOS token if not already present
+        let input_ids = if input_ids.first() != Some(&tokenizer.bos_id) {
+            let mut with_bos = vec![tokenizer.bos_id];
+            with_bos.extend(&input_ids);
+            with_bos
+        } else { input_ids };
+
         let mut state = inference::InferenceState::new();
         let mut output_ids = Vec::new();
         let mut decoded = String::new();
 
-        // Prefill + generation loop
-        for t in 0..max_tokens {
-            match engine.generate(&input_ids, &mut state) {
-                Ok(token) => {
-                    output_ids.push(token);
-
-                    // Decode incremental text
-                    let text = tokenizer.decode(&[token]);
-                    decoded.push_str(&text);
-                    eprint!("{}", text);
-
-                    // Stop at EOS
-                    if token == tokenizer.eos_id { break; }
-                }
-                Err(e) => { eprintln!("\n❌ Inference: {}", e); break; }
+        // Prefill + MTP generation loop (each call produces ~3 tokens)
+        let max_tokens = engine.sampling_params.max_tokens;
+        while output_ids.len() < max_tokens as usize {
+            let accepted = engine.generate_mtp(&input_ids, &mut state);
+            if accepted.is_empty() { break; }
+            for &token in &accepted {
+                output_ids.push(token);
+                let text = tokenizer.decode(&[token]);
+                decoded.push_str(&text);
+                eprint!("{}", text);
             }
+            if *output_ids.last().unwrap_or(&0) == tokenizer.eos_id { break; }
         }
         eprintln!("\n✅ Generated {} tokens", output_ids.len());
 

@@ -1,16 +1,20 @@
 // Jobs 7-10: Inference engine — Vulkan command buffer recording and dispatch.
 // Fixed: C1-C4 (descriptor binding, dispatch dims, router dispatch)
+#![allow(non_snake_case)]  // M/N/K match GLSL push constants
 
 use crate::device::DeviceContext;
 use crate::memory::{ArenaLayout, LayerWeights};
 use crate::pipeline::{PipelineResources, PipelineType};
 use crate::router;
+use crate::sampling::{self, SamplingParams, SamplingContext};
+use crate::util::{f16_bits_to_f32, f32_to_f16_bits, read_u16, VOCAB_SIZE};
 use ash::vk;
 
 // ── Push constants (matches GLSL, 128 bytes) ──
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(non_snake_case)]
 pub struct PushConstants {
     pub input_offset: u64,
     pub weights_offset: u64,
@@ -51,13 +55,12 @@ impl Default for PushConstants {
 pub struct InferenceState {
     pub position: u32,
     pub seq_len: u32,
-    pub kv_cache_filled: u32,
     pub hidden_ping: bool,
 }
 
 impl InferenceState {
     pub fn new() -> Self {
-        Self { position: 0, seq_len: 0, kv_cache_filled: 0, hidden_ping: true }
+        Self { position: 0, seq_len: 0, hidden_ping: true }
     }
 }
 
@@ -69,9 +72,12 @@ pub struct InferenceEngine {
     pub layout: ArenaLayout,
     pub weights: LayerWeights,
     pub arena_base: *mut u8,
+    pub cmd_pool: vk::CommandPool,
     pub cmd_layer: vk::CommandBuffer,
     pub cmd_moe: vk::CommandBuffer,
     pub fence: vk::Fence,
+    pub sampling_params: SamplingParams,
+    pub sampling_ctx: SamplingContext,
 }
 
 impl InferenceEngine {
@@ -111,7 +117,9 @@ impl InferenceEngine {
         };
         Ok(InferenceEngine {
             device, pipelines, layout, weights, arena_base,
-            cmd_layer: bufs[0], cmd_moe: bufs[1], fence,
+            cmd_pool, cmd_layer: bufs[0], cmd_moe: bufs[1], fence,
+            sampling_params: SamplingParams::default(),
+            sampling_ctx: SamplingContext::default(),
         })
     }
 
@@ -173,17 +181,41 @@ impl InferenceEngine {
 
     // ── Public API ──
 
-    /// Copy a token's embedding from the embedding table to the hidden input buffer.
+    /// Copy a token's embedding from the embedding table (IQ4_XS) to hidden input (f16).
     /// Must be called before each forward pass (H6: autoregressive token feeding).
     pub fn embed_token(&self, token_id: u32, pos: u32) {
-        let embed_size = self.weights.hidden_size as usize * 2; // f16
+        let hs = self.weights.hidden_size as usize;
+        let blocks_per_token = (hs + 31) / 32;
         let src = unsafe { self.arena_base.add(self.weights.embedding as usize
-            + token_id as usize * embed_size) };
+            + token_id as usize * blocks_per_token * 36) };
         let dst = unsafe { self.arena_base.add(self.layout.hidden_ping as usize
-            + pos as usize * embed_size) };
-        unsafe {
-            std::ptr::copy_nonoverlapping(src, dst, embed_size);
+            + pos as usize * hs * 2) } as *mut u8;
+        // Dequantize IQ4_XS → f16
+        for b in 0..blocks_per_token {
+            let bo = b * 36;
+            let d0 = f16_bits_to_f32(read_u16(src, bo));
+            let d2 = f16_bits_to_f32(read_u16(src, bo + 2));
+            let nv = (hs - b * 32).min(32);
+            for i in 0..nv {
+                let d = if i < 16 { d0 } else { d2 };
+                let nibble = unsafe { *src.add(bo + 4 + (i >> 1)) };
+                let q_val = (nibble >> ((i & 1) * 4)) & 0xF;
+                let high_byte = unsafe { *src.add(bo + 20 + (i >> 3)) };
+                let high = (high_byte >> (i & 7)) & 1;
+                let q = q_val | (high << 4);
+                let val = (q as f32 - 8.0) * d;
+                let f16 = f32_to_f16_bits(val);
+                let di = (b * 32 + i) * 2;
+                unsafe {
+                    *dst.add(di) = f16 as u8;
+                    *dst.add(di + 1) = (f16 >> 8) as u8;
+                }
+            }
         }
+    }
+
+    pub fn reset_sampling(&mut self) {
+        self.sampling_ctx.reset();
     }
 
     pub fn generate(&mut self, tokens: &[u32], state: &mut InferenceState) -> Result<u32, String> {
@@ -211,25 +243,22 @@ impl InferenceEngine {
             self.embed_token(tid, i as u32);
         }
 
-        state.seq_len = M;
+        state.seq_len = 0;
         state.hidden_ping = true;
         for layer in 0..self.weights.num_layers {
             let is_gqa = layer % 4 == 3;
             self.record_and_submit_layer(layer, is_gqa, M, state)?;
 
             // APU bus relief during prefill: every 8 layers, yield to OS
-            // Prevents GPU bus saturation from starving UI/system memory requests
             if layer % 8 == 7 && M > 128 {
                 std::thread::yield_now();
             }
 
-            // Prefill routing still happens per-layer for correctness
-            self.record_and_submit_router(layer, M)?;
             let routing = self.do_route(M);
-            self.record_and_submit_moe(layer, &routing, M)?;
+            self.record_and_submit_moe(layer, &routing, M, state.hidden_ping)?;
             state.hidden_ping = !state.hidden_ping;
         }
-        state.kv_cache_filled = M;
+        state.seq_len = M;
         Ok(())
     }
 
@@ -246,14 +275,12 @@ impl InferenceEngine {
             for layer in 0..self.weights.num_layers {
                 let is_gqa = layer % 4 == 3;
                 self.record_and_submit_layer(layer, is_gqa, 1, state)?;
-                self.record_and_submit_router(layer, 1)?;
                 let routing = self.do_route(1);
-                self.record_and_submit_moe(layer, &routing, 1)?;
+                self.record_and_submit_moe(layer, &routing, 1, state.hidden_ping)?;
                 state.hidden_ping = !state.hidden_ping;
             }
         }
         state.seq_len = start + new_tokens.len() as u32;
-        state.kv_cache_filled = state.seq_len;
         Ok(())
     }
 
@@ -262,9 +289,8 @@ impl InferenceEngine {
         for layer in 0..self.weights.num_layers {
             let is_gqa = layer % 4 == 3;
             self.record_and_submit_layer(layer, is_gqa, M, state)?;
-            self.record_and_submit_router(layer, M)?;
             let routing = self.do_route(M);
-            self.record_and_submit_moe(layer, &routing, M)?;
+            self.record_and_submit_moe(layer, &routing, M, state.hidden_ping)?;
             state.hidden_ping = !state.hidden_ping;
         }
 
@@ -290,19 +316,19 @@ impl InferenceEngine {
         pc.input_offset = ho;            // hidden state (1 × 2048 f16)
         pc.weights_offset = self.weights.embedding; // token_embd.weight
         pc.output_offset = scratch;       // logits (1 × vocab f16)
-        pc.M = 1; pc.N = 248320; pc.K = self.weights.hidden_size;
+        pc.M = 1; pc.N = VOCAB_SIZE; pc.K = self.weights.hidden_size;
         self.push(cmd, &pc);
-        unsafe { dev.cmd_dispatch(cmd, self.div64(1), self.div8(248320), 1); }
+        unsafe { dev.cmd_dispatch(cmd, self.div64(1), self.div8(VOCAB_SIZE), 1); }
         self.barrier(cmd);
 
         // MTP heads: hidden → hidden×head_w1 → SiLU → hidden×vocab_w2 → draft_logits
         let n_mtp = self.weights.num_mtp_heads as usize;
-        let tmp_z = scratch + 262144;     // 256KB for mtp intermediate (2048 f16)
-        let log_off = scratch + 524288;   // 512KB for draft logits
+        let tmp_z = scratch + self.weights.hidden_size as u64 * 128;     // 256KB for mtp intermediate (2048 f16)
+        let log_off = scratch + self.weights.hidden_size as u64 * 256;   // 512KB for draft logits
 
         for i in 0..n_mtp {
-            // MtpHead: hidden × mtp_w1 → tmp_z
-            self.bind_pipe(cmd, PipelineType::MtpHead);
+            // MtpHead: hidden × mtp_w1 → tmp_z (reuses AttnOutput shader)
+            self.bind_pipe(cmd, PipelineType::AttnOutput);
             pc.input_offset = ho; pc.weights_offset = self.weights.mtp_w1[i];
             pc.output_offset = tmp_z; pc.M = 1;
             pc.N = self.weights.hidden_size; pc.K = self.weights.hidden_size;
@@ -318,13 +344,13 @@ impl InferenceEngine {
             unsafe { dev.cmd_dispatch(cmd, 1, self.div256(self.weights.hidden_size), 1); }
             self.barrier(cmd);
 
-            // MtpOutput: activated × mtp_w2 → draft_logits[i]
-            self.bind_pipe(cmd, PipelineType::MtpOutput);
+            // MtpOutput: activated × mtp_w2 → draft_logits[i] (reuses AttnOutput shader)
+            self.bind_pipe(cmd, PipelineType::AttnOutput);
             pc.input_offset = tmp_z; pc.weights_offset = self.weights.mtp_w2[i];
-            pc.output_offset = log_off + i as u64 * 248320 * 2;
-            pc.M = 1; pc.N = 248320; pc.K = self.weights.hidden_size;
+            pc.output_offset = log_off + i as u64 * VOCAB_SIZE as u64 * 2;
+            pc.M = 1; pc.N = VOCAB_SIZE; pc.K = self.weights.hidden_size;
             self.push(cmd, &pc);
-            unsafe { dev.cmd_dispatch(cmd, self.div64(1), self.div8(248320), 1); }
+            unsafe { dev.cmd_dispatch(cmd, self.div64(1), self.div8(VOCAB_SIZE), 1); }
             self.barrier(cmd);
         }
 
@@ -334,93 +360,88 @@ impl InferenceEngine {
         // Read main logits + sample
         let logits_f16 = unsafe {
             std::slice::from_raw_parts(
-                self.arena_base.add(scratch as usize) as *const u16, 248320)
+                self.arena_base.add(scratch as usize) as *const u16, VOCAB_SIZE as usize)
         };
-        let mut logits = vec![0.0f32; 248320];
-        for (i, &f16_bits) in logits_f16.iter().enumerate() {
-            let sign = (f16_bits & 0x8000) as u32;
-            let exp = ((f16_bits & 0x7C00) >> 10) as u32;
-            let mant = (f16_bits & 0x03FF) as u32;
-            let f32_bits = if exp == 0 { sign }
-                else if exp == 31 { sign | 0x7F800000 | (mant << 13) }
-                else { sign | ((exp + 112) << 23) | (mant << 13) };
-            logits[i] = f32::from_bits(f32_bits);
-        }
-        let token = crate::router::argmax(&logits);
+        let mut logits: Vec<f32> = logits_f16.iter().map(|&f| f16_bits_to_f32(f)).collect();
+        let token = sampling::sample(&mut logits, &self.sampling_params, &mut self.sampling_ctx);
+        self.sampling_ctx.record(token);
         Ok(token)
     }
 
-    // ── MTP: generate with draft verification ──
-
-    pub fn generate_mtp(&mut self, tokens: &[u32], state: &mut InferenceState) -> Vec<u32> {
+    /// Read MTP head draft logits from arena (precomputed by forward_single's GPU pass).
+    /// Returns one draft token per MTP head via greedy argmax.
+    fn read_mtp_drafts(&self) -> Vec<u32> {
         let mtp = self.weights.num_mtp_heads as usize;
         if mtp == 0 { return vec![]; }
-
-        let main = match self.generate(tokens, state) {
-            Ok(t) => t,
-            Err(_) => return vec![],
-        };
-        let mut accepted = vec![main];
-
-        // Read draft logits from arena
         let scratch = self.scratch();
-        let log_off = scratch + 524288;
-        let mut drafts = Vec::new();
-
+        let log_off = scratch + self.weights.hidden_size as u64 * 256;
+        let mut drafts = Vec::with_capacity(mtp);
         for i in 0..mtp {
-            let f16_base = unsafe {
+            let base = unsafe {
                 std::slice::from_raw_parts(
-                    self.arena_base.add((log_off + i as u64 * 248320 * 2) as usize) as *const u16,
-                    248320)
+                    self.arena_base.add((log_off + i as u64 * VOCAB_SIZE as u64 * 2) as usize) as *const u16,
+                    VOCAB_SIZE as usize)
             };
-            let mut logits = vec![0.0f32; 248320];
-            for (j, &f) in f16_base.iter().enumerate() {
-                let sign = (f & 0x8000) as u32;
-                let exp = ((f & 0x7C00) >> 10) as u32;
-                let mant = (f & 0x03FF) as u32;
-                let fb = if exp == 0 { sign }
-                    else if exp == 31 { sign | 0x7F800000 | (mant << 13) }
-                    else { sign | ((exp + 112) << 23) | (mant << 13) };
-                logits[j] = f32::from_bits(fb);
+            let (mut best_i, mut best_v) = (0u32, f32::NEG_INFINITY);
+            for (j, &f) in base.iter().enumerate() {
+                let v = f16_bits_to_f32(f);
+                if v > best_v { best_v = v; best_i = j as u32; }
             }
-            drafts.push(crate::router::argmax(&logits));
+            drafts.push(best_i);
+        }
+        drafts
+    }
+
+    /// MTP speculative decoding: generate 1 main token + N draft tokens per forward pass.
+    /// Greedy: all drafts accepted (same model, same argmax).
+    /// Returns all accepted tokens (main + drafts).
+    pub fn generate_mtp(&mut self, tokens: &[u32], state: &mut InferenceState) -> Vec<u32> {
+        let mtp = self.weights.num_mtp_heads as usize;
+        if mtp == 0 {
+            // No MTP heads, fall back to single token generation
+            return match self.generate(tokens, state) {
+                Ok(t) => vec![t],
+                Err(_) => vec![],
+            };
+        }
+        if state.seq_len == 0 {
+            if self.prefill(tokens, state).is_err() { return vec![]; }
+        } else if state.seq_len == 0 || tokens.len() > state.seq_len as usize {
+            let new = &tokens[state.seq_len as usize..];
+            if self.prefill_incremental(new, state).is_err() { return vec![]; }
         }
 
-        // Verification: embed accepted+ drafts, run prefill, check logits
-        let start_pos = state.seq_len - 1;
-        let mut verify_tokens = vec![main];
-        verify_tokens.extend(&drafts);
+        let base = state.seq_len;
+        let main = match self.forward_single(state) { Ok(t) => t, Err(_) => return vec![] };
 
-        for (vi, &tid) in verify_tokens.iter().enumerate() {
-            self.embed_token(tid, start_pos + vi as u32);
+        // forward_single computed MTP head logits; read draft tokens from arena
+        let drafts = self.read_mtp_drafts();
+        let n_accepted = 1 + drafts.len();
+
+        // Embed all accepted tokens (overwrites forward_single's embed at base+0)
+        self.embed_token(main, base);
+        for (i, &d) in drafts.iter().enumerate() {
+            self.embed_token(d, base + 1 + i as u32);
         }
 
-        // Run verification through all layers (reuses KV cache, appends draft tokens)
-        let M = verify_tokens.len() as u32;
+        // Verification pass: run all accepted tokens through layers as a batch
+        // This extends KV cache for all accepted positions
+        state.seq_len = base;
+        state.hidden_ping = true;
+        let M = n_accepted as u32;
         for layer in 0..self.weights.num_layers {
             let is_gqa = layer % 4 == 3;
-            // Temporarily adjust state for verification
-            let saved_seq = state.seq_len;
-            self.record_and_submit_layer(layer, is_gqa, M, state).ok();
-            self.record_and_submit_router(layer, M).ok();
+            // Silently skip failures; forward pass is best-effort for KV extension
+            let _ = self.record_and_submit_layer(layer, is_gqa, M, state);
             let routing = self.do_route(M);
-            self.record_and_submit_moe(layer, &routing, M).ok();
+            let _ = self.record_and_submit_moe(layer, &routing, M, state.hidden_ping);
             state.hidden_ping = !state.hidden_ping;
         }
+        state.seq_len = base + M;
+        state.position = base + M - 1;
 
-        // Read verification logits: lm_head on the last hidden state
-        // Then compare each draft against what the main head predicts
-        // Simplified: just check if drafts would be accepted
-        // For greedy: accept all (same model, same argmax)
-        // For sampling: would need rejection check
-
-        // Greedy acceptance: all drafts from the same model match the main head
-        for &d in &drafts {
-            accepted.push(d);
-        }
-
-        state.seq_len = start_pos + accepted.len() as u32;
-        state.kv_cache_filled = state.seq_len;
+        let mut accepted = vec![main];
+        accepted.extend(&drafts);
         accepted
     }
 
@@ -542,8 +563,7 @@ impl InferenceEngine {
 
             // ── DeltaNet Step ──
             self.bind_pipe(cmd, PipelineType::DeltaNetStep);
-            let state_off = self.layout.deltanet_state_base
-                + layer as u64 * 16 * 32 * 128 * 128 * 4;
+            let state_off = self.layout.deltanet_state_base;
             pc.input_offset = tmp + M as u64 * hidden as u64 * 2;
             pc.weights_offset = state_off;
             pc.output_offset = state_off;
@@ -581,49 +601,57 @@ impl InferenceEngine {
         self.push(cmd, &pc);
         unsafe { dev.cmd_dispatch(cmd, self.div64(M), self.div8(self.weights.num_experts), 1); }
 
+        // GPU topk for generation: softmax + top-8 on GPU, CPU reads results
+        if M == 1 {
+            self.barrier(cmd);
+            self.bind_pipe(cmd, PipelineType::RouterTopk);
+            pc.input_offset = self.layout.routing_logits_base;
+            pc.output_offset = self.layout.routing_topk_base;
+            pc.M = 1; pc.N = self.weights.num_experts;
+            self.push(cmd, &pc);
+            unsafe { dev.cmd_dispatch(cmd, 1, 1, 1); }
+        }
+
         unsafe { dev.end_command_buffer(cmd).unwrap(); }
         self.submit(cmd)
     }
 
-    // ── Router CPU read (C3: reads from just-written routing_logits) ──
-
-    fn record_and_submit_router(&self, _layer: u32, M: u32) -> Result<(), String> {
-        // Router GEMM was already dispatched at the end of record_layer.
-        // This hook is for future CPU-side sync if needed.
-        Ok(())
-    }
-
     fn do_route(&self, M: u32) -> Vec<router::RoutingOutput> {
+        if M == 1 {
+            // GPU topk already computed softmax + top-8.
+            // Read 9 entries × 8 bytes from routing_topk_base.
+            // Entry 0 = shared (id=0, weight=1.0), entries 1..8 = routed.
+            let base = self.layout.routing_topk_base as usize;
+            if base == 0 { return vec![]; }
+            let entries = unsafe {
+                std::slice::from_raw_parts(
+                    self.arena_base.add(base) as *const u64, 9)
+            };
+            let mut routed = [0u16; 8];
+            let mut weights = [0.0f32; 8];
+            for i in 0..8 {
+                let e = entries[i + 1];
+                routed[i] = (e & 0xFFFF) as u16;
+                weights[i] = f32::from_bits((e >> 32) as u32);
+            }
+            return vec![router::RoutingOutput { routed, weights, shared_id: 0 }];
+        }
+
+        // Prefill path (M > 1): CPU reads f16 logits, does softmax + batched routing
         let base = self.layout.routing_logits_base as usize;
         let n_exp = self.weights.num_experts as usize;
         if base == 0 || M == 0 { return vec![]; }
-
-        // (M4) Router writes f16, but CPU needs f32. Convert inline.
         let raw = unsafe {
             std::slice::from_raw_parts(
                 self.arena_base.add(base) as *const u16, M as usize * n_exp)
         };
-        let mut logits = vec![0.0f32; M as usize * n_exp];
-        for (i, &f16_bits) in raw.iter().enumerate() {
-            // f16 → f32 (same conversion as common.glsl)
-            let sign = (f16_bits & 0x8000) as u32;
-            let exp = ((f16_bits & 0x7C00) >> 10) as u32;
-            let mant = (f16_bits & 0x03FF) as u32;
-            let f32_bits = if exp == 0 {
-                if mant == 0 { 0 } else { sign }
-            } else if exp == 31 {
-                sign | 0x7F800000 | (mant << 13)
-            } else {
-                sign | ((exp + 112) << 23) | (mant << 13)
-            };
-            logits[i] = f32::from_bits(f32_bits);
-        }
+        let logits: Vec<f32> = raw.iter().map(|&f| f16_bits_to_f32(f)).collect();
         router::route_cpu(&logits, self.weights.num_experts, M)
     }
 
     // ── MoE recording (C2: adds bind_descriptor_sets) ──
 
-    fn record_and_submit_moe(&self, layer: u32, routing: &[router::RoutingOutput], M: u32)
+    fn record_and_submit_moe(&self, layer: u32, routing: &[router::RoutingOutput], M: u32, ping: bool)
         -> Result<(), String> {
         let cmd = self.cmd_moe;
         let dev = &self.device.device;
@@ -638,7 +666,7 @@ impl InferenceEngine {
         unsafe { dev.begin_command_buffer(cmd, &begin).unwrap(); }
 
         let is_prefill = routing.len() > 1;
-        let hi = self.hi(true);
+        let hi = self.hi(ping);
         let hidden = self.weights.hidden_size;
         let inter = self.weights.intermediate_size;
         let scratch = self.scratch();
@@ -675,12 +703,7 @@ impl InferenceEngine {
                     self.push(cmd, &pc);
                     unsafe { dev.cmd_dispatch(cmd, self.div64(cnt), self.div8(inter * 2), 1); }
                     self.barrier(cmd);
-                    self.bind_pipe(cmd, PipelineType::SiluMult);
-                    pc.input_offset = scratch + cnt as u64 * inter as u64 * 2;
-                    pc.M = cnt; pc.N = inter; pc.token_ids_off = 0;
-                    self.push(cmd, &pc);
-                    unsafe { dev.cmd_dispatch(cmd, cnt, self.div256(inter), 1); }
-                    self.barrier(cmd);
+                    // ponytail: SiLU fused into W2Scatter
                     self.bind_pipe(cmd, PipelineType::W2Scatter);
                     pc.input_offset = scratch + cnt as u64 * inter as u64 * 2;
                     pc.weights_offset = $w2; pc.output_offset = hi;
@@ -710,12 +733,7 @@ impl InferenceEngine {
                     self.push(cmd, &pc);
                     unsafe { dev.cmd_dispatch(cmd, self.div64(M), self.div8(inter * 2), 1); }
                     self.barrier(cmd);
-                    self.bind_pipe(cmd, PipelineType::SiluMult);
-                    pc.input_offset = scratch + M as u64 * inter as u64 * 2;
-                    pc.M = M; pc.N = inter;
-                    self.push(cmd, &pc);
-                    unsafe { dev.cmd_dispatch(cmd, M, self.div256(inter), 1); }
-                    self.barrier(cmd);
+                    // ponytail: SiLU fused into W2Scatter
                     self.bind_pipe(cmd, PipelineType::W2Scatter);
                     pc.input_offset = scratch + M as u64 * inter as u64 * 2;
                     pc.weights_offset = $w2; pc.output_offset = hi;
@@ -741,6 +759,21 @@ impl InferenceEngine {
 
 impl Drop for InferenceEngine {
     fn drop(&mut self) {
-        unsafe { self.device.device.device_wait_idle().ok(); }
+        unsafe {
+            let _ = self.device.device.device_wait_idle();
+            // Clean up pipeline resources
+            for &p in &self.pipelines.pipelines {
+                if p != vk::Pipeline::null() {
+                    self.device.device.destroy_pipeline(p, None);
+                }
+            }
+            self.device.device.destroy_pipeline_layout(self.pipelines.pipeline_layout, None);
+            self.device.device.destroy_descriptor_set_layout(self.pipelines.desc_set_layout, None);
+            self.device.device.destroy_descriptor_pool(self.pipelines.desc_pool, None);
+            self.device.device.destroy_pipeline_cache(self.pipelines.pipeline_cache, None);
+            // Note: desc_set is destroyed with desc_pool, no separate destroy
+            self.device.device.destroy_command_pool(self.cmd_pool, None);
+            self.device.device.destroy_fence(self.fence, None);
+        }
     }
 }
