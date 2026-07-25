@@ -522,7 +522,7 @@ impl InferenceEngine {
             // GQA layers are at indices 3,7,11,...,39 → compact index = layer/4
             let gqa_idx = layer / 4;
             let cache_layer = self.layout.kv_cache_base
-                + gqa_idx as u64 * (self.layout.kv_cache_size / 10);
+                + gqa_idx as u64 * self.layout.kv_cache_layer_stride;
             self.bind_pipe(cmd, PipelineType::KvWrite);
             pc.input_offset = tmp + M as u64 * hidden as u64 * 2; // Q+K+V buffer
             pc.weights_offset = cache_layer;

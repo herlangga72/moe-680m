@@ -15,6 +15,7 @@ pub struct ArenaLayout {
     pub hidden_pong: u64,
     pub kv_cache_base: u64,
     pub kv_cache_size: u64,
+    pub kv_cache_layer_stride: u64,   // bytes per GQA layer slice (kv_cache_size / 10)
     pub deltanet_state_base: u64,
     pub deltanet_state_size: u64,
     pub scratch_base: u64,            // GPU: MoE intermediate compute
@@ -45,9 +46,10 @@ impl ArenaLayout {
         off += hidden_per_buffer;
 
         // KV cache: Q4_0, (512/32)*18 = 288 B/token for K + 288 B/token for V
-        // 10 GQA layers (every 4th, indices 3,7,...,39). kv_cache_size/10 = per-layer slice.
+        // 10 GQA layers (every 4th, indices 3,7,...,39).
         let kv_per_layer = cfg.context_length as u64 * 288 * 2;
         let kv_cache_size = align(10 * kv_per_layer);
+        let kv_cache_layer_stride = kv_per_layer;
         let kv_cache_base = off;
         off += kv_cache_size;
 
@@ -86,7 +88,7 @@ impl ArenaLayout {
         ArenaLayout {
             weights_base,
             hidden_ping, hidden_pong,
-            kv_cache_base, kv_cache_size,
+            kv_cache_base, kv_cache_size, kv_cache_layer_stride,
             deltanet_state_base, deltanet_state_size,
             scratch_base, temp_base, routing_logits_base,
             routing_topk_base, routing_token_base, routing_weight_base,
