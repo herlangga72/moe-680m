@@ -38,6 +38,7 @@ fn print_help() {
     eprintln!("  --debug              Debug output (or MOE_DEBUG=1)");
     eprintln!("  --validate           Vulkan validation layers (MOE_VK_VALIDATION=1)");
     eprintln!("  --tui                Interactive TUI configuration");
+    eprintln!("  --chat               Interactive chat mode (multi-turn)");
     eprintln!("  --smoke              Run Vulkan smoke test");
     eprintln!("  --model <PATH>       Load GGUF model");
     eprintln!("  --prompt <TEXT>      Run inference prompt");
@@ -56,6 +57,7 @@ fn main() {
     let mut prompt = None::<String>;
     let mut max_tokens = 100u32;
     let mut server_port = None::<u16>;
+    let mut flag_chat = false;
 
     while i < args.len() {
         match args[i].as_str() {
@@ -63,6 +65,7 @@ fn main() {
             "--validate" => debug.vk_validation = true,
             "--smoke" => flag_smoke = true,
             "--tui" => flag_tui = true,
+            "--chat" => flag_chat = true,
             "--model" => { i += 1; model_path = Some(args.get(i).cloned().unwrap_or_default()); }
             "--prompt" => { i += 1; prompt = Some(args.get(i).cloned().unwrap_or_default()); }
             "--max-tokens" => { i += 1; max_tokens = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(100); }
@@ -86,6 +89,7 @@ fn main() {
             server_port = cfg.server_port;
             debug.enabled |= cfg.debug;
             debug.vk_validation |= cfg.vk_validation;
+            flag_chat = cfg.chat;
         } else { return; }
     } else if flag_smoke {
         run_smoke(&debug);
@@ -93,7 +97,7 @@ fn main() {
     }
 
     if let Some(path) = model_path {
-        run_inference(&path, prompt.as_deref(), max_tokens, &debug, server_port);
+        run_inference(&path, prompt.as_deref(), max_tokens, &debug, server_port, flag_chat);
     }
 }
 
@@ -159,7 +163,7 @@ fn meta_get_int(meta: &std::collections::HashMap<String, gguf::MetadataValue>, k
 // ── Inference ──
 
 fn run_inference(model_path: &str, prompt_text: Option<&str>, max_tokens: u32,
-                 debug: &DebugContext, server_port: Option<u16>) {
+                 debug: &DebugContext, server_port: Option<u16>, chat: bool) {
     // 1. Memory-map GGUF
     eprintln!("Loading model: {}", model_path);
     let file = match std::fs::File::open(model_path) {
@@ -326,6 +330,49 @@ fn run_inference(model_path: &str, prompt_text: Option<&str>, max_tokens: u32,
         }
         eprintln!("\n✅ Generated {} tokens", output_ids.len());
 
+        if chat {
+            chat_loop(&tokenizer, &mut engine, &mut state, &decoded);
+        }
+
         unsafe { engine.device.device.destroy_buffer(arena_buffer, None); engine.device.device.free_memory(arena_mem, None); }
+    }
+}
+
+fn chat_loop(tokenizer: &tokenizer::Tokenizer, engine: &mut inference::InferenceEngine,
+             state: &mut inference::InferenceState, initial_response: &str) {
+    use std::io::{stdin, stdout, Write};
+
+    let mut conversation = initial_response.to_string();
+    let max_tokens = engine.sampling_params.max_tokens;
+
+    loop {
+        print!("\n> ");
+        stdout().flush().ok();
+        let mut input = String::new();
+        if stdin().read_line(&mut input).ok() != Some(1) { break; }
+        let input = input.trim().to_string();
+        if input.is_empty() || input == "/exit" || input == "/quit" { break; }
+
+        // Build full conversation with chat template
+        conversation.push_str(&format!("\n<|im_start|>user\n{}\n<|im_end|>\n<|im_start|>assistant\n", input));
+
+        let input_ids = tokenizer.encode(&conversation);
+        let mut output_ids = Vec::new();
+        let mut decoded = String::new();
+        engine.reset_sampling();
+
+        while output_ids.len() < max_tokens as usize {
+            let accepted = engine.generate_mtp(&input_ids, state);
+            if accepted.is_empty() { break; }
+            for &token in &accepted {
+                output_ids.push(token);
+                let text = tokenizer.decode(&[token]);
+                decoded.push_str(&text);
+                print!("{}", text);
+                stdout().flush().ok();
+            }
+            if *output_ids.last().unwrap_or(&0) == tokenizer.eos_id { break; }
+        }
+        conversation.push_str(&decoded);
     }
 }
