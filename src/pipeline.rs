@@ -12,7 +12,7 @@ macro_rules! debug_log {
     };
 }
 
-pub const MAX_PIPELINES: usize = 17;
+pub const MAX_PIPELINES: usize = 19;
 
 /// Pipeline type enum — direct index into `pipelines[]`.
 #[repr(u32)]
@@ -35,6 +35,8 @@ pub enum PipelineType {
     ResidualAdd = 14,
     SiluMult = 15,
     Rope = 16,
+    MtpHead = 17,
+    MtpOutput = 18,
 }
 
 pub struct PipelineResources {
@@ -206,6 +208,8 @@ pub unsafe fn create_pipelines(
     try_pipeline!(PipelineType::ResidualAdd, "residual_add");
     try_pipeline!(PipelineType::SiluMult, "silu_mult");
     try_pipeline!(PipelineType::Rope, "rope");
+    try_pipeline!(PipelineType::MtpHead, "attn_output");
+    try_pipeline!(PipelineType::MtpOutput, "attn_output");
 
     // Save pipeline cache
     if let Ok(data) = device.get_pipeline_cache_data(pipeline_cache) {

@@ -259,8 +259,11 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// Per-layer offsets for all weight matrices.
 /// Indexed by layer number (0..block_count).
 pub struct LayerWeights {
-    pub embedding: u64,          // token_embd.weight (for H6)
+    pub embedding: u64,          // token_embd.weight
     pub max_seq_len: u32,        // context_length
+    pub mtp_w1: Vec<u64>,        // [num_mtp_heads] hidden×hidden
+    pub mtp_w2: Vec<u64>,        // [num_mtp_heads] hidden×vocab
+    pub num_mtp_heads: u32,      // 2 for Qwen3.6
     pub attn_q: Vec<u64>,
     pub attn_k: Vec<u64>,
     pub attn_v: Vec<u64>,
@@ -332,9 +335,19 @@ impl LayerWeights {
             }
         }
 
+        // MTP heads (try 2, fall back to 0 if not in model)
+        let num_mtp = if lk("output.mtp_head.0.weight") != 0 { 2u32 } else { 0u32 };
+        let mut mtp_w1 = Vec::with_capacity(num_mtp as usize);
+        let mut mtp_w2 = Vec::with_capacity(num_mtp as usize);
+        for i in 0..num_mtp {
+            mtp_w1.push(lk(&format!("output.mtp_head.{}.weight", i)));
+            mtp_w2.push(lk(&format!("output.mtp_head.{}.output.weight", i)));
+        }
+
         LayerWeights {
             embedding: lk("token_embd.weight"),
             max_seq_len: cfg.context_length,
+            mtp_w1, mtp_w2, num_mtp_heads: num_mtp,
             attn_q, attn_k, attn_v, attn_output, attn_gate,
             attn_norm, ffn_norm, ffn_gate,
             shared_w1, shared_w2, shared_w3,
