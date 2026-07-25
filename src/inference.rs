@@ -78,6 +78,7 @@ pub struct InferenceEngine {
     pub fence: vk::Fence,
     pub sampling_params: SamplingParams,
     pub sampling_ctx: SamplingContext,
+    logits_buf: Vec<f32>,  // reused alloc for lm_head + draft logits
 }
 
 impl InferenceEngine {
@@ -120,6 +121,7 @@ impl InferenceEngine {
             cmd_pool, cmd_layer: bufs[0], cmd_moe: bufs[1], fence,
             sampling_params: SamplingParams::default(),
             sampling_ctx: SamplingContext::default(),
+            logits_buf: vec![0.0f32; VOCAB_SIZE as usize],
         })
     }
 
@@ -362,35 +364,33 @@ impl InferenceEngine {
         unsafe { dev.end_command_buffer(cmd).unwrap(); }
         self.submit(cmd)?;
 
-        // Read main logits (SIMD batch f16→f32), sample
+        // Read main logits (SIMD batch f16→f32 into reused buffer), sample
         let logits_f16 = unsafe {
             std::slice::from_raw_parts(
                 self.arena_base.add(scratch as usize) as *const u16, VOCAB_SIZE as usize)
         };
-        let mut logits = vec![0.0f32; VOCAB_SIZE as usize];
-        crate::util::f16_slice_to_f32(logits_f16, &mut logits);
-        let token = sampling::sample(&mut logits, &self.sampling_params, &mut self.sampling_ctx);
+        crate::util::f16_slice_to_f32(logits_f16, &mut self.logits_buf);
+        let token = sampling::sample(&mut self.logits_buf, &self.sampling_params, &mut self.sampling_ctx);
         self.sampling_ctx.record(token);
         Ok(token)
     }
 
     /// Read MTP head draft logits from arena (precomputed by forward_single's GPU pass).
     /// Returns one draft token per MTP head via greedy argmax.
-    fn read_mtp_drafts(&self) -> Vec<u32> {
+    fn read_mtp_drafts(&mut self) -> Vec<u32> {
         let mtp = self.weights.num_mtp_heads as usize;
         if mtp == 0 { return vec![]; }
         let scratch = self.scratch();
         let log_off = scratch + self.weights.hidden_size as u64 * 256;
         let mut drafts = Vec::with_capacity(mtp);
-        let mut buf = vec![0.0f32; VOCAB_SIZE as usize];
         for i in 0..mtp {
             let base = unsafe {
                 std::slice::from_raw_parts(
                     self.arena_base.add((log_off + i as u64 * VOCAB_SIZE as u64 * 2) as usize) as *const u16,
                     VOCAB_SIZE as usize)
             };
-            crate::util::f16_slice_to_f32(base, &mut buf);
-            drafts.push(crate::util::argmax(&buf));
+            crate::util::f16_slice_to_f32(base, &mut self.logits_buf);
+            drafts.push(crate::util::argmax(&self.logits_buf));
         }
         drafts
     }
