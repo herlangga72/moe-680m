@@ -7,6 +7,7 @@ mod router;
 mod sampling;
 mod tokenizer;
 mod util;
+mod tui;
 #[cfg(feature = "server")]
 mod server;
 
@@ -36,6 +37,7 @@ fn print_help() {
     eprintln!("Options:");
     eprintln!("  --debug              Debug output (or MOE_DEBUG=1)");
     eprintln!("  --validate           Vulkan validation layers (MOE_VK_VALIDATION=1)");
+    eprintln!("  --tui                Interactive TUI configuration");
     eprintln!("  --smoke              Run Vulkan smoke test");
     eprintln!("  --model <PATH>       Load GGUF model");
     eprintln!("  --prompt <TEXT>      Run inference prompt");
@@ -49,6 +51,7 @@ fn main() {
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
     let mut flag_smoke = false;
+    let mut flag_tui = false;
     let mut model_path = None::<String>;
     let mut prompt = None::<String>;
     let mut max_tokens = 100u32;
@@ -59,6 +62,7 @@ fn main() {
             "--debug" | "-d" => debug.enabled = true,
             "--validate" => debug.vk_validation = true,
             "--smoke" => flag_smoke = true,
+            "--tui" => flag_tui = true,
             "--model" => { i += 1; model_path = Some(args.get(i).cloned().unwrap_or_default()); }
             "--prompt" => { i += 1; prompt = Some(args.get(i).cloned().unwrap_or_default()); }
             "--max-tokens" => { i += 1; max_tokens = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(100); }
@@ -72,7 +76,18 @@ fn main() {
         i += 1;
     }
 
-    if flag_smoke || (model_path.is_none() && server_port.is_none() && prompt.is_none()) {
+    // Default: TUI when no args. --smoke for smoke test. --model for CLI mode.
+    if args.len() == 1 || flag_tui {
+        if let Some(cfg) = tui::run() {
+            if cfg.smoke { run_smoke(&debug); return; }
+            model_path = cfg.model_path;
+            prompt = Some(cfg.prompt);
+            max_tokens = cfg.max_tokens;
+            server_port = cfg.server_port;
+            debug.enabled |= cfg.debug;
+            debug.vk_validation |= cfg.vk_validation;
+        } else { return; }
+    } else if flag_smoke {
         run_smoke(&debug);
         return;
     }
