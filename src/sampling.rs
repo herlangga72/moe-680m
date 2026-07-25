@@ -38,9 +38,9 @@ impl Default for SamplingContext {
 
 /// Sample from logits given parameters.
 pub fn sample(logits: &mut [f32], params: &SamplingParams, ctx: &mut SamplingContext) -> u32 {
-    // Greedy fast path
+    // Greedy fast path (LLVM vectorizes argmax with maxps)
     if params.temperature == 0.0 {
-        return argmax(logits);
+        return crate::util::argmax(logits);
     }
 
     // Temperature
@@ -57,31 +57,41 @@ pub fn sample(logits: &mut [f32], params: &SamplingParams, ctx: &mut SamplingCon
         }
     }
 
-    // Softmax
+    // Softmax: exp
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0;
     for l in logits.iter_mut() {
         *l = (*l - max).exp();
         sum += *l;
     }
-    if sum > 0.0 { let inv = 1.0 / sum; for l in logits.iter_mut() { *l *= inv; } }
+    // Flush zero-distribution (all logits were -inf or similar)
+    if sum <= 0.0 { return 0; }
 
-    // Sample (xorshift)
-    let r = xorshift_f32(&mut ctx.rng_state);
+    // Normalize and build CDF in-place (overwrites probs with cumulative)
+    let inv = 1.0 / sum;
     let mut cum = 0.0;
-    for (i, &p) in logits.iter().enumerate() {
-        cum += p;
-        if r < cum { return i as u32; }
+    for l in logits.iter_mut() {
+        cum += *l * inv;
+        *l = cum;
     }
-    0
+
+    // Branchless binary search on CDF
+    // Comparison compiles to ucomiss + setbe (no branch), mask arithmetic for lo/hi
+    let r = xorshift_f32(&mut ctx.rng_state);
+    let mut lo = 0usize;
+    let mut hi = logits.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let go_right = (logits[mid] <= r) as usize;    // setcc, no branch
+        let mask = go_right.wrapping_neg();             // 0 or !0
+        lo = ((mid + 1) & mask) | (lo & !mask);
+        hi = (mid & !mask) | (hi & mask);
+    }
+    // Guard: if r > cdf[last] (FP epsilon), cap at last valid index
+    (lo as u32).min(logits.len() as u32 - 1)
 }
 
-fn argmax(logits: &[f32]) -> u32 {
-    logits.iter().enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
-}
+// argmax moved to crate::util::argmax (SIMD-friendly manual loop)
 
 fn xorshift_f32(state: &mut u64) -> f32 {
     *state = state.wrapping_add(1);

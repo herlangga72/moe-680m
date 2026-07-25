@@ -197,7 +197,7 @@ impl InferenceEngine {
             let d2 = f16_bits_to_f32(read_u16(src, bo + 2));
             let nv = (hs - b * 32).min(32);
             for i in 0..nv {
-                let d = if i < 16 { d0 } else { d2 };
+                let d = [d0, d2][(i >> 4) as usize];
                 let nibble = unsafe { *src.add(bo + 4 + (i >> 1)) };
                 let q_val = (nibble >> ((i & 1) * 4)) & 0xF;
                 let high_byte = unsafe { *src.add(bo + 20 + (i >> 3)) };
@@ -357,12 +357,13 @@ impl InferenceEngine {
         unsafe { dev.end_command_buffer(cmd).unwrap(); }
         self.submit(cmd)?;
 
-        // Read main logits + sample
+        // Read main logits (SIMD batch f16→f32), sample
         let logits_f16 = unsafe {
             std::slice::from_raw_parts(
                 self.arena_base.add(scratch as usize) as *const u16, VOCAB_SIZE as usize)
         };
-        let mut logits: Vec<f32> = logits_f16.iter().map(|&f| f16_bits_to_f32(f)).collect();
+        let mut logits = vec![0.0f32; VOCAB_SIZE as usize];
+        crate::util::f16_slice_to_f32(logits_f16, &mut logits);
         let token = sampling::sample(&mut logits, &self.sampling_params, &mut self.sampling_ctx);
         self.sampling_ctx.record(token);
         Ok(token)
@@ -376,18 +377,15 @@ impl InferenceEngine {
         let scratch = self.scratch();
         let log_off = scratch + self.weights.hidden_size as u64 * 256;
         let mut drafts = Vec::with_capacity(mtp);
+        let mut buf = vec![0.0f32; VOCAB_SIZE as usize];
         for i in 0..mtp {
             let base = unsafe {
                 std::slice::from_raw_parts(
                     self.arena_base.add((log_off + i as u64 * VOCAB_SIZE as u64 * 2) as usize) as *const u16,
                     VOCAB_SIZE as usize)
             };
-            let (mut best_i, mut best_v) = (0u32, f32::NEG_INFINITY);
-            for (j, &f) in base.iter().enumerate() {
-                let v = f16_bits_to_f32(f);
-                if v > best_v { best_v = v; best_i = j as u32; }
-            }
-            drafts.push(best_i);
+            crate::util::f16_slice_to_f32(base, &mut buf);
+            drafts.push(crate::util::argmax(&buf));
         }
         drafts
     }
@@ -649,9 +647,7 @@ impl InferenceEngine {
         for t in 0..M as usize {
             let off = t * n_exp;
             let mut logits = [0.0f32; 256];
-            for i in 0..n_exp {
-                logits[i] = f16_bits_to_f32(raw[off + i]);
-            }
+            crate::util::f16_slice_to_f32(&raw[off..off + n_exp], &mut logits);
             results.push(router::route_single(&logits));
         }
         results

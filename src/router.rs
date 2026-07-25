@@ -9,6 +9,7 @@ pub struct RoutingOutput {
 
 /// Read routing logits from coherent GPU memory, compute softmax + top-8.
 /// `logits_base` is the CPU-accessible pointer to the [num_tokens × 256] f32 array.
+#[allow(dead_code)]
 pub fn route_cpu(logits: &[f32], num_experts: u32, num_tokens: u32) -> Vec<RoutingOutput> {
     let mut results = Vec::with_capacity(num_tokens as usize);
     for t in 0..num_tokens as usize {
