@@ -1,4 +1,6 @@
-// ── DeltaNet state update: S = gate·S + (1-gate)·outer(k,v) ──
+// ── DeltaNet state update: S = gate·S (decay only) ──
+// QKV buffer layout (4128 f16): Q[2048] + K[2048] + gate[32]
+// V not present in this model variant — state decays without outer product.
 // Per head pair (QK head × V head), state S is 128×128 f32
 // Dispatch: (16 QK heads, 32 V heads, 1)
 // Each TG: 128 threads, handles one QK×V head pair
@@ -20,12 +22,10 @@ layout(push_constant) uniform PC {
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
-// QKV input layout per head pair: q[128] + k[128] + v[128] + gate(f32)
-// Total per head pair: 128+128+128+1 = 385 f32 = 1540 bytes
-// QKV at input_offset: [q for all 16] [k for all 16] [v for all 32] [gate for 32]
-// We need to locate our specific head pair's data
-
-shared float sv[128];  // v vector for this head pair (loaded cooperatively)
+// QKV buffer layout (bytes from input_offset):
+//   Q[16×128] at 0
+//   K[16×128] at 16×128×2
+//   gate[32]  at 32×128×2   (= element 4096, the last 32 of 4128)
 
 void main() {
     uint qkh = gl_GlobalInvocationID.x; // 0..15
@@ -37,70 +37,47 @@ void main() {
     uint64_t q_base = pc.input_offset;
     uint64_t state_base = pc.weights_offset + uint64_t(pc.layer_idx) * 16 * 32 * 128 * 128 * 4;
 
-    // Locate this head pair's data in QKV output (u16/f16 stride 2):
-    // Q[16×128] at offset 0
-    // K[16×128] at offset 16×128×2
-    // V[32×128] at offset 32×128×2
-    // G[32]     at offset 64×128×2
-
     uint64_t q_off = q_base + qkh * 128 * 2 + row * 2;
     uint64_t k_off = q_base + 16*128*2 + qkh * 128 * 2 + row * 2;
-    uint64_t v_off = q_base + 32*128*2 + vh * 128 * 2 + row * 2;
 
-    // Read q[row], k[row] for this thread (f16 input from GEMM)
-    uint64_t kq = k_off;
     float k_val = f16_to_f32(read_u16(k_off));
     float q_val = f16_to_f32(read_u16(q_off));
 
-    // Cooperative: thread row loads V[row]
-    sv[row] = f16_to_f32(read_u16(v_off));
-    barrier(); // all v values loaded
-
-    // Read gate for this V head
-    uint64_t g_off = q_base + 64*128*2 + vh * 2;
+    // Read gate: last 32 elements of the 4128-element QKV buffer (element 4096 + vh)
+    uint64_t g_off = q_base + 4096 * 2 + vh * 2;
     float gate = f16_to_f32(read_u16(g_off));
     float one_minus_gate = 1.0 - gate;
 
-    // State base for this head pair: [qkh][vh] = layer * 16*32*128*128 + qkh*32*128*128 + vh*128*128
-    // Actually: state is flat [layer][qkh][vh][128][128]
-    uint64_t hp_off = state_base + qkh * 32 * 128 * 128 * 4 + vh * 128 * 128 * 4;
-    // S[row][col] is at hp_off + row*128*4 + col*4
+    // V is not present in this model variant's QKV output. State decays without outer product.
+    // S = gate·S  (no outer(k,v) term)
 
-    // Update S row by row: for this row, for each col 0..127
-    // S[row][col] = gate * S[row][col] + (1-gate) * k[row] * v[col]
-    // Load S row in chunks, update, write back
+    // State base for this head pair
+    uint64_t hp_off = state_base + qkh * 32 * 128 * 128 * 4 + vh * 128 * 128 * 4;
+
+    // Update S row by row: S[row][col] = gate * S[row][col]
     for (uint c = 0; c < 128; c += 32) {
         uint64_t s_off = hp_off + row * 128 * 4 + c * 4;
-
-        // Load 32 elements of S[row][c..c+31]
-        // Each thread reads 32 consecutive floats (1 word each) — fine
         for (uint cc = 0; cc < 32; cc++) {
             uint wi = uint((s_off + cc*4)>>2);
             float s_val = uintBitsToFloat(data[wi]);
-            float new_s = gate * s_val + one_minus_gate * k_val * sv[c + cc];
+            float new_s = gate * s_val;
             data[wi] = floatBitsToUint(new_s);
         }
     }
 
-    // Read gate for the output — actually the same gate scales the output
     barrier();
 
     // Output: o[row] = Σ S[row][j] × q[j] for j in 0..127
-    // This is 128 multiply-adds per row. Each thread does its row.
     float o_val = 0.0;
     for (uint j = 0; j < 128; j++) {
         uint64_t s_off = hp_off + row * 128 * 4 + j * 4;
         float s_val = uintBitsToFloat(data[uint(s_off>>2)]);
-        // Need q[j] for all j — this requires all q values
-        // We only have q[row] locally. Need shared q array.
-        // Simplified: read from global again
         uint64_t qj_off = q_base + qkh * 128 * 2 + j * 2;
         float qj = f16_to_f32(read_u16(qj_off));
         o_val += s_val * qj;
     }
 
-    // Write output: V_head × 128 dims, at output_offset
-    // Output is for the output projection: 32 V heads × 128 dim = 4096 elements
+    // Write output to output_offset + vh*128*4 + row*4
     uint64_t oa = pc.output_offset + vh * 128 * 4 + row * 4;
     data[uint(oa>>2)] = floatBitsToUint(o_val);
 }
