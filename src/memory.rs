@@ -71,9 +71,9 @@ impl ArenaLayout {
         let routing_logits_base = off;
         off += align(cfg.context_length as u64 * cfg.expert_count as u64 * 4);
 
-        // GPU topk results: 9 entries × 8B each (expert_id:u16 + weight:f32 packed)
-        // ponytail: only used for generation (M=1), needs 72 B total. Allocate 256 for alignment.
-        let routing_topk_size = 256u64;
+        // GPU topk results: 9 entries × 8B per token (expert_id:u16 + weight:f32 packed)
+        // Sized for max prefill batch (8192 × 72 = 576 KB). Used for both gen and prefill.
+        let routing_topk_size = align((8192u64).min(cfg.context_length as u64) * 72);
         let routing_topk_base = off;
         off += routing_topk_size;
 

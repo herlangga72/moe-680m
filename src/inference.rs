@@ -35,6 +35,7 @@ pub struct PushConstants {
 
 unsafe impl bytemuck::Zeroable for PushConstants {}
 unsafe impl bytemuck::Pod for PushConstants {}
+const _: () = assert!(std::mem::size_of::<PushConstants>() == 128);
 
 impl Default for PushConstants {
     fn default() -> Self {
@@ -700,56 +701,38 @@ impl InferenceEngine {
         self.push(cmd, &pc);
         unsafe { dev.cmd_dispatch(cmd, self.div64(M), self.div8(self.weights.num_experts), 1); }
 
-        // GPU topk for generation: softmax + top-8 on GPU, CPU reads results
-        if M == 1 {
-            self.barrier(cmd);
-            self.bind_pipe(cmd, PipelineType::RouterTopk);
-            pc.input_offset = self.layout.routing_logits_base;
-            pc.output_offset = self.layout.routing_topk_base;
-            pc.M = 1; pc.N = self.weights.num_experts;
-            self.push(cmd, &pc);
-            unsafe { dev.cmd_dispatch(cmd, 1, 1, 1); }
-        }
+        // GPU topk: softmax + top-8. Works for any M (router_topk dispatches per-token).
+        self.barrier(cmd);
+        self.bind_pipe(cmd, PipelineType::RouterTopk);
+        pc.input_offset = self.layout.routing_logits_base;
+        pc.output_offset = self.layout.routing_topk_base;
+        pc.M = M; pc.N = self.weights.num_experts;
+        self.push(cmd, &pc);
+        unsafe { dev.cmd_dispatch(cmd, M.max(1), 1, 1); }
 
         unsafe { dev.end_command_buffer(cmd).unwrap(); }
         self.submit(cmd)
     }
 
     fn do_route(&self, M: u32) -> Vec<router::RoutingOutput> {
-        if M == 1 {
-            // GPU topk already computed softmax + top-8.
-            // Read 9 entries × 8 bytes from routing_topk_base.
-            // Entry 0 = shared (id=0, weight=1.0), entries 1..8 = routed.
-            let base = self.layout.routing_topk_base as usize;
-            if base == 0 { return vec![]; }
-            let entries = unsafe {
-                std::slice::from_raw_parts(
-                    self.arena_base.add(base) as *const u64, 9)
-            };
-            let mut routed = [0u16; 8];
-            let mut weights = [0.0f32; 8];
-            for i in 0..8 {
-                let e = entries[i + 1];
-                routed[i] = (e & 0xFFFF) as u16;
-                weights[i] = f32::from_bits((e >> 32) as u32);
-            }
-            return vec![router::RoutingOutput { routed, weights, shared_id: 0 }];
-        }
-
-        // Prefill path (M > 1): process tokens one at a time on stack (no alloc)
-        let base = self.layout.routing_logits_base as usize;
-        let n_exp = self.weights.num_experts as usize;
+        // GPU topk computed softmax + top-8 for all tokens.
+        // Read M × 9 entries × 8 bytes from routing_topk_base.
+        let base = self.layout.routing_topk_base as usize;
         if base == 0 || M == 0 { return vec![]; }
-        let raw = unsafe {
+        let entries = unsafe {
             std::slice::from_raw_parts(
-                self.arena_base.add(base) as *const u16, M as usize * n_exp)
+                self.arena_base.add(base) as *const u64, M as usize * 9)
         };
         let mut results = Vec::with_capacity(M as usize);
         for t in 0..M as usize {
-            let off = t * n_exp;
-            let mut logits = [0.0f32; 256];
-            crate::util::f16_slice_to_f32(&raw[off..off + n_exp], &mut logits);
-            results.push(router::route_single(&logits));
+            let mut routed = [0u16; 8];
+            let mut weights = [0.0f32; 8];
+            for i in 0..8 {
+                let e = entries[t * 9 + i + 1];  // entry 0 = shared (id=0, weight=1.0)
+                routed[i] = (e & 0xFFFF) as u16;
+                weights[i] = f32::from_bits((e >> 32) as u32);
+            }
+            results.push(router::RoutingOutput { routed, weights, shared_id: 0 });
         }
         results
     }
