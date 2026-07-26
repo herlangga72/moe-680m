@@ -1,0 +1,182 @@
+// ── moe_fused: 9 expert W1W3Fused + SiLU + W2Scatter in one kernel ──
+// For M=1 (generation). Fuses 18 dispatches per layer into 1.
+// Dispatch: (1, 1032, 1) × 128 threads. Covers W1W3 output (8256) + W2 output (2048).
+// LDS: gate_up[8256] f32 (33 KB) + At[64][33] (8 KB) + Bt[32][8] (1 KB) = 42 KB
+
+// Expert data written to arena by Rust before dispatch:
+//   routing_weight_base+0:    9 × f32 routing weights (36 B)
+//   routing_weight_base+36:   9 × u64 W1 offset (72 B)
+//   routing_weight_base+108:  9 × u64 W3 offset (72 B)
+//   routing_weight_base+180:  9 × u64 W2 offset (72 B)
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(std430, binding = 0) buffer Arena { uint data[]; };
+layout(push_constant) uniform PC {
+    uint64_t input_offset;     // hi (hidden state)
+    uint64_t output_offset;    // ho (output)
+    uint64_t _scratch;
+    uint M; uint N; uint K; uint inter;
+    uint64_t expert_data_base;  // arena: weight offsets start here
+    uint num_qk_heads; uint num_v_heads;
+    uint layer_idx; uint _pad1; uint64_t routing_weights_off; // arena: routing weights
+    float scale_factor;
+} pc;
+
+#include "common.glsl"
+
+const uint EXP = 9;
+const uint INTER = 4128;
+const uint INTER2 = 8256;
+const uint HIDDEN = 2048;
+const uint TK = 32;
+
+shared float gate_up[INTER2];
+shared float At[64][33];
+shared float Bt[32][8];
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+uint64_t load_u64(uint64_t base) {
+    uint lo = data[uint(base>>2)];
+    uint hi = data[uint(base>>2)+1u];
+    return uint64_t(lo) | (uint64_t(hi) << 32);
+}
+
+void main() {
+    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;
+    uint oc = gl_GlobalInvocationID.y * 8;
+    uint n0 = oc + ty * 2;
+
+    // ── Read expert data from arena ──
+    uint64_t w1o[EXP], w3o[EXP], w2o[EXP];
+    float rw[EXP];
+    for (uint e = 0; e < EXP; e++) {
+        w1o[e] = load_u64(pc.expert_data_base + uint64_t(e)*24 + 0);
+        w3o[e] = load_u64(pc.expert_data_base + uint64_t(e)*24 + 8);
+        w2o[e] = load_u64(pc.expert_data_base + uint64_t(e)*24 + 16);
+        uint raw = data[uint((pc.routing_weights_off + uint64_t(e)*4)>>2)];
+        rw[e] = uintBitsToFloat(raw);
+    }
+
+    float a00=0,a01=0,a10=0,a11=0;
+
+    for (uint e = 0; e < EXP; e++) {
+        // ── Phase 1: W1W3Fused ──
+        float g00=0,g01=0,g10=0,g11=0, u00=0,u01=0,u10=0,u11=0;
+
+        for (uint k = 0; k < pc.K; k += TK) {
+            for (uint r = 0; r < 2; r++) for (uint c = 0; c < 8; c++) {
+                uint mr = tx*2+r, mc = ty*8+c;
+                uint64_t a = pc.input_offset + (k + mc) * 2;
+                if (r > 0) a = pc.input_offset + (k + mc) * 2; // M=1: row 0 only
+                if (k+mc < pc.K) {
+                    uint w = data[uint(a>>2)];
+                    At[mr][mc] = f16_to_f32((w>>(uint(a&3)*8))&0xFFFF);
+                } else At[mr][mc] = 0;
+            }
+            barrier();
+
+            // W1 (gate): columns 0..INTER-1
+            for (uint off = 0; off < 8; off += 4) {
+                uint nc = ty + off;
+                if (k+tx < pc.K && oc+nc < INTER) {
+                    Bt[tx][nc] = dequant_iq4_xs(w1o[e], (k+tx)*INTER2 + oc+nc);
+                } else Bt[tx][nc] = 0;
+            }
+            barrier();
+            for (uint kk = 0; kk < TK; kk++) {
+                float a0=At[tx*2+0][kk], a1=At[tx*2+1][kk];
+                float b0=Bt[kk][ty*2+0], b1=Bt[kk][ty*2+1];
+                g00+=a0*b0; g01+=a0*b1; g10+=a1*b0; g11+=a1*b1;
+            }
+            barrier();
+
+            // W3 (up): columns INTER..INTER2-1
+            for (uint off = 0; off < 8; off += 4) {
+                uint nc = ty + off;
+                uint col = oc + nc;
+                if (k+tx < pc.K && col >= INTER && col < INTER2) {
+                    Bt[tx][nc] = dequant_iq4_xs(w3o[e], (k+tx)*INTER + (col - INTER));
+                } else Bt[tx][nc] = 0;
+            }
+            barrier();
+            for (uint kk = 0; kk < TK; kk++) {
+                float a0=At[tx*2+0][kk], a1=At[tx*2+1][kk];
+                float b0=Bt[kk][ty*2+0], b1=Bt[kk][ty*2+1];
+                u00+=a0*b0; u01+=a0*b1; u10+=a1*b0; u11+=a1*b1;
+            }
+            barrier();
+        }
+
+        // Write gate+up to LDS
+        for (uint r = 0; r < 2; r++) for (uint c = 0; c < 2; c++) {
+            uint ni = n0 + c;
+            if (ni >= INTER2) continue;
+            float gv = r==0?(c==0?g00:g01):(c==0?g10:g11);
+            if (ni < INTER) gate_up[ni] = gv;
+            else gate_up[ni] = gv;
+        }
+        barrier();
+
+        // ── Phase 2: SiLU(gate) × up ──
+        for (uint i = tx + ty*32; i < INTER; i += 128) {
+            float g = gate_up[i];
+            float u = gate_up[INTER + i];
+            gate_up[i] = silu(g) * u;
+        }
+        barrier();
+
+        // ── Phase 3: W2 ──
+        float s00=0,s01=0,s10=0,s11=0;
+        for (uint k = 0; k < INTER; k += TK) {
+            for (uint r = 0; r < 2; r++) for (uint c = 0; c < 8; c++) {
+                uint mr = tx*2+r, mc = ty*8+c;
+                if (k+mc < INTER) {
+                    At[mr][mc] = gate_up[k + mc];
+                } else At[mr][mc] = 0;
+            }
+            barrier();
+
+            for (uint off = 0; off < 8; off += 4) {
+                uint nc = ty + off;
+                if (k+tx < INTER && oc+nc < pc.N) {
+                    Bt[tx][nc] = dequant_iq4_xs(w2o[e], (k+tx)*pc.N + oc+nc);
+                } else Bt[tx][nc] = 0;
+            }
+            barrier();
+
+            for (uint kk = 0; kk < TK; kk++) {
+                float a0=At[tx*2+0][kk], a1=At[tx*2+1][kk];
+                float b0=Bt[kk][ty*2+0], b1=Bt[kk][ty*2+1];
+                s00+=a0*b0; s01+=a0*b1; s10+=a1*b0; s11+=a1*b1;
+            }
+            barrier();
+        }
+
+        // Weight and add
+        for (uint r = 0; r < 2; r++) for (uint c = 0; c < 2; c++) {
+            uint ni = n0 + c;
+            if (ni >= pc.N) continue;
+            float v = r==0?(c==0?s00:s01):(c==0?s10:s11);
+            float wv = v * rw[e];
+            if (r==0 && c==0) a00 += wv;
+            else if (r==0 && c==1) a01 += wv;
+            else if (r==1 && c==0) a10 += wv;
+            else a11 += wv;
+        }
+        barrier();
+    }
+
+    // ── Write final output ──
+    for (uint r = 0; r < 2; r++) for (uint c = 0; c < 2; c++) {
+        uint ni = n0 + c;
+        if (ni >= pc.N) continue;
+        float v = r==0?(c==0?a00:a01):(c==0?a10:a11);
+        uint f16 = f32_to_f16(v);
+        uint64_t oa = pc.output_offset + uint64_t(ni) * 2;
+        uint wi = uint(oa>>2), sh = uint(oa&3)*8;
+        data[wi] = (data[wi]&~(0xFFFFu<<sh))|(f16<<sh);
+    }
+}

@@ -12,7 +12,7 @@ macro_rules! debug_log {
     };
 }
 
-pub const MAX_PIPELINES: usize = 24;
+pub const MAX_PIPELINES: usize = 25;
 
 /// Pipeline type enum — direct index into `pipelines[]`.
 #[repr(u32)]
@@ -39,6 +39,7 @@ pub enum PipelineType {
     AttnResidual = 18,
     FusedRmsNormDnQkv = 19,
     DnOutputResidual = 20,
+    MoeFused = 21,
 }
 
 pub struct PipelineResources {
@@ -216,6 +217,7 @@ pub unsafe fn create_pipelines(
     try_pipeline!(PipelineType::AttnResidual, "attn_residual");
     try_pipeline!(PipelineType::FusedRmsNormDnQkv, "rms_norm_dn_qkv");
     try_pipeline!(PipelineType::DnOutputResidual, "dn_output_residual");
+    try_pipeline!(PipelineType::MoeFused, "moe_fused");
 
     // Save pipeline cache
     if let Ok(data) = device.get_pipeline_cache_data(pipeline_cache) {

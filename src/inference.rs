@@ -809,6 +809,45 @@ impl InferenceEngine {
                 let base = layer as usize * 256 + e;
                 batch_exp!(self.weights.expert_w1[base], self.weights.expert_w3[base], self.weights.expert_w2[base], e);
             }
+        } else if M == 1 && self.pipelines.pipelines[PipelineType::MoeFused as usize] != vk::Pipeline::null() {
+            // ── Fused MoE: all 9 experts in one dispatch ──
+            let _tok_base = self.layout.routing_token_base;
+            let wgt_base = self.layout.routing_weight_base;
+            // Write expert weight offsets to arena: 9 × 3 × u64 at wgt_base + 36
+            let off_base = wgt_base + 36;
+            unsafe {
+                let wgt_ptr = self.arena_base.add(wgt_base as usize) as *mut f32;
+                let off_ptr = self.arena_base.add(off_base as usize) as *mut u64;
+                // Shared expert first
+                *wgt_ptr = 1.0;
+                *off_ptr = self.weights.shared_w1[layer as usize];
+                *off_ptr.add(1) = self.weights.shared_w3[layer as usize];
+                *off_ptr.add(2) = self.weights.shared_w2[layer as usize];
+                if let Some(r) = routing.first() {
+                    for i in 0usize..8 {
+                        let base = layer as usize * 256 + r.routed[i] as usize;
+                        *wgt_ptr.add(1 + i) = r.weights[i];
+                        let eo = off_ptr.add((1 + i) * 3);
+                        *eo = self.weights.expert_w1[base];
+                        *eo.add(1) = self.weights.expert_w3[base];
+                        *eo.add(2) = self.weights.expert_w2[base];
+                    }
+                }
+            }
+            let moe_ho = self.ho(ping);
+            self.bind_pipe(cmd, PipelineType::MoeFused);
+            let mut pc = PushConstants::default();
+            pc.input_offset = hi;
+            pc.output_offset = moe_ho;
+            pc.M = 1; pc.N = hidden; pc.K = hidden;
+            pc.num_experts = inter;          // maps to shader 'inter'
+            pc.routing_weights_off = off_base; // maps to shader 'expert_data_base'
+            pc.token_ids_off = wgt_base;     // maps to shader 'routing_weights_off'
+            pc.scale_factor = 1.0;
+            // Zero unused fields for cleanliness
+            pc.weights_offset = 0;
+            self.push(cmd, &pc);
+            unsafe { dev.cmd_dispatch(cmd, 1, 1032, 1); }
         } else {
             // ── Generation: sequential per expert (M=1) ──
             let mut pc = PushConstants::default();
