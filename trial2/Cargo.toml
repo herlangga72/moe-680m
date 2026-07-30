@@ -12,8 +12,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 gigatoken = "0.2"
 hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = "0.1"
-tokio = { version = "1", features = ["rt", "macros", "sync"] }
+hyper-util = { version = "0.1", features = ["server", "tokio"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt", "macros", "sync", "net"] }
 futures = "0.3"
 thiserror = "2"
 
