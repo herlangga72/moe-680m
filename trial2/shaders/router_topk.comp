@@ -18,8 +18,82 @@ layout(set = 0, binding = 4) buffer Buf4 { float data_out[]; };
 
 #include "common.glsl"
 
+shared float s_logits[256];  // up to 256 experts
+
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.rows) return;
-    data_out[i] = data[i];
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.cols;            // hidden dimension
+    uint n_experts = pc.stride;
+    uint n_active = pc.pad0;
+    uint n_shared = pc.opt0;
+
+    // ── Linear projection: logits = input × weight^T ──
+    for (uint j = tid; j < n_experts; j += 256u) {
+        float sum = 0.0;
+        for (uint k = 0u; k < dim; k++) {
+            sum += data[k] * dequant_iq4_xs(0u, j * dim + k);
+        }
+        s_logits[j] = sum;
+    }
+    barrier();
+    memoryBarrierShared();
+
+    // ── Softmax ──
+    // Thread 0 does the full softmax (n_experts is small, typically 8-128)
+    if (tid == 0u) {
+        // Find max
+        float mx = -3.4e38;
+        for (uint j = 0u; j < n_experts; j++) {
+            mx = max(mx, s_logits[j]);
+        }
+
+        // Compute exp and sum
+        float sum_exp = 0.0;
+        for (uint j = 0u; j < n_experts; j++) {
+            float e = exp(s_logits[j] - mx);
+            s_logits[j] = e;
+            sum_exp += e;
+        }
+
+        // Normalize
+        float inv_sum = 1.0 / sum_exp;
+        for (uint j = 0u; j < n_experts; j++) {
+            s_logits[j] = s_logits[j] * inv_sum;
+        }
+
+        // ── Top-K selection ──
+        float top_vals[8];
+        uint top_idxs[8];
+        for (uint i = 0u; i < n_active && i < 8u; i++) {
+            top_vals[i] = -1.0;
+            top_idxs[i] = 0u;
+        }
+
+        for (uint j = 0u; j < n_experts; j++) {
+            float v = s_logits[j];
+            for (uint i = 0u; i < n_active && i < 8u; i++) {
+                if (v > top_vals[i]) {
+                    for (uint k = min(n_active, 8u) - 1u; k > i; k--) {
+                        top_vals[k] = top_vals[k - 1u];
+                        top_idxs[k] = top_idxs[k - 1u];
+                    }
+                    top_vals[i] = v;
+                    top_idxs[i] = j;
+                    break;
+                }
+            }
+        }
+
+        // Write output: gate_indices followed by gate_weights (FP16)
+        for (uint i = 0u; i < n_active && i < 8u; i++) {
+            data_out[i] = float(top_idxs[i]);            // expert index
+            store_f16((n_active + i) * 2u, float16_t(top_vals[i])); // weight as FP16
+        }
+
+        // Append shared expert indices
+        for (uint i = 0u; i < n_shared && i < 8u; i++) {
+            data_out[n_active + i] = float(n_experts + i); // shared expert index
+            // Shared expert weight is always 1.0 (handled by caller)
+        }
+    }
 }

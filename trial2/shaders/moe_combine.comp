@@ -19,7 +19,36 @@ layout(set = 0, binding = 4) buffer Buf4 { float data_out[]; };
 #include "common.glsl"
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.rows) return;
-    data_out[i] = data[i];
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.cols;                   // hidden dimension
+    uint n_active = pc.stride;            // number of active (non-shared) experts
+    uint n_shared = pc.pad0;              // number of shared experts (0 or 1)
+    uint has_shared = pc.opt0;
+
+    // Buffer layout:
+    //   data[0..n_active*dim)    : expert outputs (one per active expert, dim each)
+    //   data_w[0..n_active)       : gate weights (FP16 via store_f16/load_f16)
+    //   data[n_active*dim..]      : shared expert output (if has_shared)
+    //   data_out[0..dim)          : final combined output
+
+    for (uint j = tid; j < dim; j += 256u) {
+        float acc = 0.0;
+
+        // Weighted sum of active expert outputs
+        for (uint i = 0u; i < n_active; i++) {
+            float w = float(load_f16(i * 2u));  // gate weight from data_w (FP16)
+            float expert_val = data[i * dim + j]; // expert output
+            acc += w * expert_val;
+        }
+
+        // Add shared expert output (if present)
+        if (has_shared != 0u && n_shared > 0u) {
+            float shared_val = data[n_active * dim + j];
+            // Shared experts always have weight 1.0
+            acc += shared_val;
+        }
+
+        // Write as FP16 to data_out
+        store_f16(j * 2u, float16_t(acc));
+    }
 }

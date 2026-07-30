@@ -20,7 +20,46 @@ layout(set = 0, binding = 5) buffer Buf5 { float data_out[]; };
 #include "common.glsl"
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.rows) return;
-    data_out[i] = data[i];
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.cols;                    // hidden dimension
+    uint ffn_intermediate = pc.opt0;
+    uint expert_idx = pc.opt1;             // which expert to use
+    uint is_shared = pc.opt2;              // 1 if this is a shared expert
+
+    uint row_offset = pc.rows;             // output row offset
+
+    // We have two weight matrices positioned sequentially in data16:
+    //   gate_weight: [expert][ffn_intermediate * dim]
+    //   up_weight:   [expert][ffn_intermediate * dim]
+    // The expert_idx selects which expert's weights to use.
+    // Weight matrices are stored in data16, indexed through dequant_iq4_xs().
+    //
+    // Each weight matrix for one expert has ffn_intermediate rows × dim columns.
+    // The dequant function indexes elements linearly: element_idx = row * dim + col
+    // For expert e, the gate weight starts at e * ffn_intermediate * dim, etc.
+    // But since dequant_iq4_xs ignores blk_start, the offset must be zero-based.
+    // The caller ensures the data16 buffer binding points to the correct expert's
+    // weight data. So we index from 0 for each call.
+
+    uint gate_offset = 0u;  // gate weight starts at data16 offset 0
+    uint up_offset = ffn_intermediate * dim;  // up weight after gate weight
+
+    uint total_out = 2u * ffn_intermediate;
+
+    for (uint j = tid; j < total_out; j += 256u) {
+        float sum = 0.0;
+        if (j < ffn_intermediate) {
+            // Gate projection
+            for (uint k = 0u; k < dim; k++) {
+                sum += data[k] * dequant_iq4_xs(0u, j * dim + k);
+            }
+        } else {
+            // Up projection
+            uint up_j = j - ffn_intermediate;
+            for (uint k = 0u; k < dim; k++) {
+                sum += data[k] * dequant_iq4_xs(0u, up_offset + up_j * dim + k);
+            }
+        }
+        data_out[row_offset + j] = sum;
+    }
 }
