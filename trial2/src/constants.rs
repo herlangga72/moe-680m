@@ -2,8 +2,10 @@ use ash::vk;
 
 pub const ALIGNMENT: u64 = 128;
 
+use bytemuck::{Pod, Zeroable};
+
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, Zeroable, Pod)]
 pub struct RMSNormPC {
     pub rows: u32,
     pub dim: u32,
@@ -11,7 +13,7 @@ pub struct RMSNormPC {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, Zeroable, Pod)]
 pub struct LinearPC {
     pub in_dim: u32,
     pub out_dim: u32,
@@ -19,7 +21,7 @@ pub struct LinearPC {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, Zeroable, Pod)]
 pub struct AttentionPC {
     pub seq_len: u32,
     pub n_heads: u32,
@@ -29,7 +31,7 @@ pub struct AttentionPC {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, Zeroable, Pod)]
 pub struct RouterPC {
     pub dim: u32,
     pub n_experts: u32,
@@ -38,7 +40,7 @@ pub struct RouterPC {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, Zeroable, Pod)]
 pub struct MoEPC {
     pub dim: u32,
     pub intermediate: u32,
@@ -47,7 +49,7 @@ pub struct MoEPC {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, Zeroable, Pod)]
 pub struct SamplePC {
     pub vocab_size: u32,
     pub temperature: f32,
@@ -56,7 +58,7 @@ pub struct SamplePC {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, Zeroable, Pod)]
 pub struct MTPBlockPC {
     pub dim: u32,
     pub head_dim: u32,
