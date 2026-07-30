@@ -3,6 +3,7 @@ mod device;
 mod error;
 mod gguf;
 mod memory;
+mod shaders;
 
 use error::Result;
 
