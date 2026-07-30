@@ -1,6 +1,7 @@
 mod constants;
 mod device;
 mod error;
+mod gguf;
 mod memory;
 
 use error::Result;
