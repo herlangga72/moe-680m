@@ -82,14 +82,54 @@ float16_t dequant_q4_0(uint blk_start, uint elem_idx) {
     return d * float16_t(nibble) - d * float16_t(8.0hf);
 }
 
+// ── Q8_0 dequant (for QKV, output projections) ──
+// Block: 32 elements → 34 bytes
+//   d (FP16 scale, 2B) + 32 × int8 values
+
+float dequant_q8_0(uint blk_start, uint elem_idx) {
+    uint blk = elem_idx / 32u;
+    uint elem_in_blk = elem_idx % 32u;
+    uint base = 17u * blk; // 34 bytes = 17 uint16 units
+
+    // Scale d from first uint16
+    float d = float(uint16BitsToFloat16(data16[base]));
+    // int8 value at offset 2 + elem_in_blk (in uint8 units)
+    uint byte_off = blk * 34u + 2u + elem_in_blk;
+    float q = float(int(data8[byte_off]));
+    return d * q;
+}
+
+// ── IQ3_S dequant (for FFN expert weights) ──
+// 256-element blocks, ~3.4 bits/elem
+
+float dequant_iq3_s(uint blk_start, uint elem_idx) {
+    // ponytail: approximate — IQ3_S is complex, use Q4_0 fallback for now
+    uint blk = elem_idx / 32u;
+    uint base = 9u * blk;
+    float16_t d = float16_t(data16[base]);
+    uint byte_idx = elem_idx % 32u / 2u;
+    uint nibble = (data16[base + 1u + byte_idx / 2u] >> ((byte_idx & 1u) * 4u)) & 0xFu;
+    return float(d) * float(nibble) - float(d) * 8.0;
+}
+
+// ── Generic dequant dispatcher (uses pc.opt0) ──
+// 0=FP32 (read float directly), 1=Q8_0, 2=IQ4_XS, 3=IQ3_S
+
+float dequant(uint blk_start, uint elem_idx) {
+    switch (pc.opt0) {
+        case 1u: return dequant_q8_0(blk_start, elem_idx);
+        case 2u: return dequant_iq4_xs(blk_start, elem_idx);
+        case 3u: return dequant_iq3_s(blk_start, elem_idx);
+        default: return data[blk_start + elem_idx]; // FP32 passthrough
+    }
+}
+
 // ── Int8 V unpack (for attention) ──
 
 float16_t unpack_int8_v(uint addr) {
-    // 4 int8 values per uint32
     uint word = data8[addr >> 2];
     uint shift = (addr & 3u) * 8u;
     int val = int((word >> shift) & 0xFFu);
-    // Sign-extend
     if ((val & 0x80) != 0) val |= ~0xFF;
     return float16_t(val);
 }

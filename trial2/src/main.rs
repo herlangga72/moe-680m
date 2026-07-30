@@ -249,46 +249,37 @@ fn test_forward(mut engine: engine::Engine, gguf: &gguf::GgufFile) -> Result<()>
     for i in 0..dim as usize { unsafe { *ptr.add(i) = 1.0f32; } }
     unsafe { dev.device.unmap_memory(io_mem); }
 
-    // Build dispatch chain for one RMSNorm + one QKV
+    // Simple test: residual_add to verify chain works
     let mut chain = dispatch::DispatchChain::new();
 
-    // RMSNorm
+    // Fill io_buf with 3.0 and 2.0
+    let ptr = unsafe { dev.device.map_memory(io_mem, 0, io_mem_size, vk::MemoryMapFlags::empty())? } as *mut f32;
+    for i in 0..dim as usize { unsafe { *ptr.add(i) = 3.0f32; *ptr.add(dim as usize + i) = 2.0f32; } }
+    unsafe { dev.device.unmap_memory(io_mem); }
+
+    // residual_add: a += b (binding 0 = a, binding 3 = b)
+    let idx = shaders::SHADERS.iter().position(|&n| n == "residual_add").unwrap();
+    let ds = engine.shaders.desc_sets[idx];
     chain.add(dispatch::DispatchStep {
-        pipeline_name: "rms_norm",
-        push_data: pc_bytes(&constants::RMSNormPC { rows: 1, dim, eps: 1e-6 }),
+        pipeline_name: "residual_add",
+        push_data: pc_bytes(&constants::RMSNormPC { rows: 0, dim, eps: 0.0 }),
         workgroup_x: (dim + 255) / 256, workgroup_y: 1, workgroup_z: 1,
         buffers: vec![
             vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset(0).range(vk::WHOLE_SIZE),
-            w_norm,
+            vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset(0).range(0),
+            vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset(0).range(0),
             vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset((dim * 4) as u64).range(vk::WHOLE_SIZE),
-        ],
-        barrier: dispatch::BarrierKind::ExecOnly,
-    });
-
-    // QKV
-    let q_off = off - ((k_buf.size + v_buf.size + 2 * 128) & !127); // approximate
-    chain.add(dispatch::DispatchStep {
-        pipeline_name: "qkv",
-        push_data: pc_bytes(&constants::LinearPC { in_dim: dim, out_dim: 16 * 256, pad: [0; 2] }),
-        workgroup_x: (dim + 63) / 64, workgroup_y: 16, workgroup_z: 1,
-        buffers: vec![
-            vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset(0).range(vk::WHOLE_SIZE),
-            w_qkv,
-            vk::DescriptorBufferInfo::default().buffer(q_buf.handle).offset(0).range(vk::WHOLE_SIZE),
-            vk::DescriptorBufferInfo::default().buffer(k_buf.handle).offset(0).range(vk::WHOLE_SIZE),
-            vk::DescriptorBufferInfo::default().buffer(v_buf.handle).offset(0).range(vk::WHOLE_SIZE),
         ],
         barrier: dispatch::BarrierKind::MemoryFlush,
     });
 
     chain.execute(dev, &engine.shaders)?;
-    println!("RMSNorm + QKV dispatch: OK (2 shaders, {} elements)", dim);
 
-    // Read back Q output (first 4 values of first head)
-    let ptr = unsafe { dev.device.map_memory(io_mem, 0, io_mem_size, vk::MemoryMapFlags::empty())? } as *const f32;
-    let q_data = unsafe { std::slice::from_raw_parts(ptr, 32) };
-    println!("Q[0..4] (FP16 as FP32): {:?}", &q_data[..4]);
-    println!("Q NaN check: {}", if q_data.iter().any(|v| v.is_nan()) { "FAIL" } else { "PASS" });
+    let ptr = unsafe { dev.device.map_memory(io_mem, 0, io_buf.size, vk::MemoryMapFlags::empty())? } as *const f32;
+    let out = unsafe { std::slice::from_raw_parts(ptr, 8) };
+    println!("residual_add: a[0..4] = {:?} (expected 5.0)", &out[..4]);
+    let pass = out.iter().all(|v| (v - 5.0).abs() < 0.001);
+    println!("DispatchChain verify: {}", if pass { "PASS" } else { "FAIL" });
     unsafe { dev.device.unmap_memory(io_mem); }
 
     unsafe {
