@@ -215,95 +215,136 @@ fn test_forward(mut engine: engine::Engine, gguf: &gguf::GgufFile) -> Result<()>
 
     let dev = &engine.device;
     let dim = engine.config.hidden_dim;
+    let n_q = engine.config.n_heads_q;
+    let n_kv = engine.config.n_heads_kv;
+    let hd = engine.config.head_dim;
 
-    // Weight pool for layer 0
-    let mut wp = weights::WeightPool::new(dev, 128 * 1024 * 1024)?; // 128 MB
-
-    // Upload layer 0 weights
+    // Upload layer-0 attention weights
+    let mut wp = weights::WeightPool::new(dev, 128 * 1024 * 1024)?;
     let w_norm = wp.upload(gguf, "blk.0.attn_norm.weight")?;
     let w_qkv = wp.upload(gguf, "blk.0.attn_qkv.weight")?;
-    println!("Uploaded: attn_norm ({}B) + attn_qkv ({}B)", w_norm.range, w_qkv.range);
-    // Check if norm weights have 16-byte garbage prefix
-    for name in ["output_norm.weight", "blk.0.attn_norm.weight", "blk.1.attn_norm.weight"] {
-        if let Some(t) = gguf.find_tensor(name) {
-            let raw = gguf.tensor_data(t);
-            let f32s: &[f32] = bytemuck::cast_slice(&raw[..32.min(raw.len())]);
-            println!("  {} (off={}): f32[0..4]={:?}", name, t.offset, &f32s[..4.min(f32s.len())]);
-        }
-    }
+    println!("Weights: attn_norm {}B + attn_qkv {}B", w_norm.range, w_qkv.range);
 
-    // Allocate I/O buffers
+    // Allocate I/O buffers: hidden (FP32), q/k/v (FP32), attn_out (FP16)
     let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
-    let io_size = (dim * 8) as u64; // FP32 input + FP16 hidden state
-    let io_buf = memory::Buffer::new(&dev.device, io_size, usage)?;
-    let q_buf = memory::Buffer::new(&dev.device, (16 * 256 * 4) as u64, usage)?; // q: FP32
-    let k_buf = memory::Buffer::new(&dev.device, (2 * 256 * 4) as u64, usage)?; // k: FP32
-    let v_buf = memory::Buffer::new(&dev.device, (2 * 256 * 4) as u64, usage)?;
+    let make_buf = |bytes: u64| memory::Buffer::new(&dev.device, bytes, usage).unwrap();
+    let hidden = make_buf((dim * 4) as u64);         // FP32 in-place
+    let q_buf = make_buf((n_q * hd * 4) as u64);     // FP32
+    let k_buf = make_buf((n_kv * hd * 4) as u64);
+    let v_buf = make_buf((n_kv * hd * 4) as u64);
+    let attn_buf = make_buf((dim * 4) as u64);       // FP32
 
-    let io_mem_size = io_size + q_buf.size + k_buf.size + v_buf.size + 3 * 128;
-    let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(io_mem_size)
-        .memory_type_index(dev.find_memory_type(u32::MAX,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)?);
-    let io_mem = unsafe { dev.device.allocate_memory(&alloc_info, None)? };
+    // Single UMA allocation for all I/O
+    let bufs: [&memory::Buffer; 5] = [&hidden, &q_buf, &k_buf, &v_buf, &attn_buf];
+    let total: u64 = bufs.iter().map(|b| (b.size + 127) & !127).sum();
+    let io_mem = unsafe {
+        let ai = vk::MemoryAllocateInfo::default().allocation_size(total)
+            .memory_type_index(dev.find_memory_type(u32::MAX,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)?);
+        dev.device.allocate_memory(&ai, None)?
+    };
     let mut off = 0u64;
-    for buf in [&io_buf, &q_buf, &k_buf, &v_buf] {
-        unsafe { dev.device.bind_buffer_memory(buf.handle, io_mem, off)?; }
-        off += (buf.size + 127) & !127;
-    }
+    for b in &bufs { unsafe { dev.device.bind_buffer_memory(b.handle, io_mem, off)?; off += (b.size + 127) & !127; } }
 
-    // Fill input with 1.0 (hidden state)
-    let ptr = unsafe { dev.device.map_memory(io_mem, 0, io_mem_size, vk::MemoryMapFlags::empty())? } as *mut f32;
+    // Fill hidden state with 1.0
+    let ptr = unsafe { dev.device.map_memory(io_mem, 0, total, vk::MemoryMapFlags::empty())? } as *mut f32;
     for i in 0..dim as usize { unsafe { *ptr.add(i) = 1.0f32; } }
     unsafe { dev.device.unmap_memory(io_mem); }
 
-    // Test RMSNorm alone first
-    let ptr = unsafe { dev.device.map_memory(io_mem, 0, io_mem_size, vk::MemoryMapFlags::empty())? } as *mut f32;
-    for i in 0..dim as usize { unsafe { *ptr.add(i) = 1.0f32; } }
-    unsafe { dev.device.unmap_memory(io_mem); }
+    let hi = || vk::DescriptorBufferInfo::default().buffer(hidden.handle).offset(0).range(vk::WHOLE_SIZE);
+    let qi = || vk::DescriptorBufferInfo::default().buffer(q_buf.handle).offset(0).range(vk::WHOLE_SIZE);
+    let ki = || vk::DescriptorBufferInfo::default().buffer(k_buf.handle).offset(0).range(vk::WHOLE_SIZE);
+    let vi = || vk::DescriptorBufferInfo::default().buffer(v_buf.handle).offset(0).range(vk::WHOLE_SIZE);
+    let ai = || vk::DescriptorBufferInfo::default().buffer(attn_buf.handle).offset(0).range(vk::WHOLE_SIZE);
 
-    // Upload real FP32 norm weight
-    let test_w = wp.upload(gguf, "blk.0.attn_norm.weight")?;
+    // QKV push constants (reusable)
+    let mut qkv_pc = [0u8; 128];
+    qkv_pc[0..4].copy_from_slice(&0u32.to_le_bytes());     // rows=offset
+    qkv_pc[4..8].copy_from_slice(&dim.to_le_bytes());      // cols=dim
+    qkv_pc[32..36].copy_from_slice(&n_q.to_le_bytes());    // opt0=n_q_heads
+    qkv_pc[36..40].copy_from_slice(&n_kv.to_le_bytes());   // opt1=n_kv_heads
+    qkv_pc[40..44].copy_from_slice(&hd.to_le_bytes());     // opt2=head_dim
+    qkv_pc[44..48].copy_from_slice(&1u32.to_le_bytes());   // opt3=1 (Q8_0 dequant)
 
-    let full = vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset(0).range(vk::WHOLE_SIZE);
-    let out_bi = vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset((dim * 4) as u64).range(vk::WHOLE_SIZE);
-    let q_bi = vk::DescriptorBufferInfo::default().buffer(q_buf.handle).offset(0).range(vk::WHOLE_SIZE);
+    // Attention push constants
+    let mut attn_pc = [0u8; 128];
+    attn_pc[0..4].copy_from_slice(&1u32.to_le_bytes());    // seq_len
+    attn_pc[4..8].copy_from_slice(&n_q.to_le_bytes());     // n_heads
+    attn_pc[8..12].copy_from_slice(&n_kv.to_le_bytes());   // n_kv_heads
+    attn_pc[12..16].copy_from_slice(&hd.to_le_bytes());    // head_dim
+    attn_pc[16..20].copy_from_slice(&dim.to_le_bytes());   // max_seq_len
 
-    // RMSNorm only, then read output
+    // Build dispatch chain: RMSNorm → QKV → RoPE → Attention → KV Write → Residual
     let mut chain = dispatch::DispatchChain::new();
-    chain.add(dispatch::DispatchStep {
+    let ex = dispatch::BarrierKind::ExecOnly;
+    let mf = dispatch::BarrierKind::MemoryFlush;
+
+    chain.add(dispatch::DispatchStep { // 1. RMSNorm
         pipeline_name: "rms_norm",
         push_data: pc_bytes(&constants::RMSNormPC { rows: 1, dim, eps: 1e-6 }),
         workgroup_x: (dim + 255) / 256, workgroup_y: 1, workgroup_z: 1,
-        buffers: vec![full, test_w, test_w, out_bi, test_w],
-        barrier: dispatch::BarrierKind::MemoryFlush,
+        buffers: vec![hi(), w_norm, w_norm, hi(), w_norm], // in=data, weight=wf32, out=data (in-place)
+        barrier: ex,
+    });
+    chain.add(dispatch::DispatchStep { // 2. QKV
+        pipeline_name: "qkv",
+        push_data: qkv_pc,
+        workgroup_x: (dim + 63) / 64, workgroup_y: n_q, workgroup_z: 1,
+        buffers: vec![hi(), w_qkv, w_qkv, qi(), ki(), vi()],
+        barrier: ex,
+    });
+    chain.add(dispatch::DispatchStep { // 3. RoPE
+        pipeline_name: "rope",
+        push_data: attn_pc,
+        workgroup_x: n_q, workgroup_y: 1, workgroup_z: 1,
+        buffers: vec![qi(), ki()],
+        barrier: ex,
+    });
+    chain.add(dispatch::DispatchStep { // 4. Attention (uses q/k/v, writes attn_out)
+        pipeline_name: "attention",
+        push_data: attn_pc,
+        workgroup_x: n_q, workgroup_y: 1, workgroup_z: 1,
+        buffers: vec![qi(), ki(), vi(), ki(), vi(), ai()], // q, k, v, k_cache(≈k), v_cache(≈v), out
+        barrier: mf,
+    });
+    chain.add(dispatch::DispatchStep { // 5. KV Write (ponytail: uses same k/v buffers as cache)
+        pipeline_name: "kv_write",
+        push_data: attn_pc,
+        workgroup_x: n_kv, workgroup_y: 1, workgroup_z: 1,
+        buffers: vec![ki(), vi(), ki(), vi()], // k, v, k_cache, v_cache
+        barrier: mf,
+    });
+    chain.add(dispatch::DispatchStep { // 6. Residual add: hidden += attn_out
+        pipeline_name: "residual_add",
+        push_data: pc_bytes(&constants::RMSNormPC { rows: 0, dim, eps: 0.0 }),
+        workgroup_x: (dim + 255) / 256, workgroup_y: 1, workgroup_z: 1,
+        buffers: vec![hi(), ai(), ai(), ai()], // data=a, data8, data16, data_b=attn_out
+        barrier: mf,
     });
 
-    // Pre-fill q_buf with sentinel 99.0 to detect shader write
-    let q_off = (io_buf.size + 127) & !127;
-    let ptr2 = unsafe { dev.device.map_memory(io_mem, q_off, q_buf.size, vk::MemoryMapFlags::empty())? } as *mut f32;
-    unsafe { *ptr2 = 99.0f32; *ptr2.add(1) = 99.0f32; }
-    unsafe { dev.device.unmap_memory(io_mem); }
-
     chain.execute(dev, &engine.shaders)?;
+    println!("Full attention chain (6 dispatches): OK");
 
-    let ptr3 = unsafe { dev.device.map_memory(io_mem, 0, io_buf.size, vk::MemoryMapFlags::empty())? } as *const f32;
-    let rms_out = unsafe { std::slice::from_raw_parts(ptr3.add(dim as usize), 8) };
-    println!("RMSNorm out[0..4] (real weight × 1.0) = {:?}", &rms_out[..4]);
-    let ok = !rms_out[0].is_nan() && rms_out[0].abs() > 0.001;
-    println!("RMSNorm: {} first={}", if ok { "PASS" } else { "FAIL" }, rms_out[0]);
-    unsafe { dev.device.unmap_memory(io_mem); }
-    unsafe { dev.device.unmap_memory(io_mem); }
-
-    unsafe {
-        dev.device.destroy_buffer(io_buf.handle, None);
-        dev.device.destroy_buffer(q_buf.handle, None);
-        dev.device.destroy_buffer(k_buf.handle, None);
-        dev.device.destroy_buffer(v_buf.handle, None);
-        dev.device.free_memory(io_mem, None);
+    // Read back attn_out
+    let attn_off = (hidden.size + 127) & !127 + (q_buf.size + 127) & !127 + (k_buf.size + 127) & !127 + (v_buf.size + 127) & !127;
+    {
+        let ptr = unsafe { dev.device.map_memory(io_mem, attn_off, attn_buf.size, vk::MemoryMapFlags::empty())? } as *const f32;
+        let attn = unsafe { std::slice::from_raw_parts(ptr, 8) };
+        println!("Attn[0..4] = {:?}", &attn[..4]);
+        let attn_ok = !attn[0].is_nan() && attn[0].abs() > 0.01;
+        println!("Attn: {} first={}", if attn_ok { "OK" } else { "ZERO?" }, attn[0]);
+        unsafe { dev.device.unmap_memory(io_mem); }
     }
-    wp.destroy();
+    let ptr = unsafe { dev.device.map_memory(io_mem, 0, hidden.size, vk::MemoryMapFlags::empty())? } as *const f32;
+    let out = unsafe { std::slice::from_raw_parts(ptr, 8) };
+    println!("Hidden[0..4] after attention+residual = {:?}", &out[..4]);
+    let ok = !out[0].is_nan();
+    println!("Full layer: {} first={}", if ok { "PASS" } else { "FAIL" }, out[0]);
 
+    unsafe { dev.device.unmap_memory(io_mem); }
+    for b in &bufs { unsafe { dev.device.destroy_buffer(b.handle, None); } }
+    unsafe { dev.device.free_memory(io_mem, None); }
+    wp.destroy();
     println!("GPU forward-pass: OK");
     Ok(())
 }
