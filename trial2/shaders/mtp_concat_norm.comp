@@ -18,8 +18,59 @@ layout(set = 0, binding = 4) buffer Buf4 { float data_out[]; };
 
 #include "common.glsl"
 
+shared float s_sg_sums[4];
+
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.rows) return;
-    data_out[i] = data[i];
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.cols;            // hidden dimension
+    float eps = pc.param0;
+
+    // Concat hidden_state (data[0..dim)) + token_emb (token_emb[0..dim))
+    // → data_out[0..2*dim) as concatenated vector
+    // Then RMSNorm on the concatenated vector
+
+    // ── Concat ──
+    // First half: copy hidden state
+    for (uint j = tid; j < dim; j += 256u) {
+        data_out[j] = data[j];
+    }
+    // Second half: copy token embedding
+    for (uint j = tid; j < dim; j += 256u) {
+        data_out[dim + j] = token_emb[j];
+    }
+    barrier();
+
+    uint concat_dim = 2u * dim;
+
+    // ── RMSNorm on concatenated vector ──
+    float sum_sq = 0.0;
+    for (uint j = tid; j < concat_dim; j += 256u) {
+        float v = data_out[j];
+        sum_sq += v * v;
+    }
+
+    float sg_sum = subgroup_sum(sum_sq);
+
+    if (gl_SubgroupInvocationID == 0u) {
+        s_sg_sums[gl_SubgroupID] = sg_sum;
+    }
+    barrier();
+    memoryBarrierShared();
+
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint i = 0u; i < 4u; i++) {
+            total += s_sg_sums[i];
+        }
+        s_sg_sums[0] = rsqrt_fast(total / float(concat_dim) + eps);
+    }
+    barrier();
+    memoryBarrierShared();
+
+    float rms = s_sg_sums[0];
+
+    // Apply RMSNorm in-place on data_out (weight = 1.0 for MTP)
+    for (uint j = tid; j < concat_dim; j += 256u) {
+        data_out[j] = data_out[j] * rms;
+    }
 }

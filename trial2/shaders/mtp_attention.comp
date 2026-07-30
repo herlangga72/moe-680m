@@ -19,8 +19,86 @@ layout(set = 0, binding = 5) buffer Buf5 { float data_out[]; };
 
 #include "common.glsl"
 
+shared float s_sg_tmp[4];
+shared float s_score;
+
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.rows) return;
-    data_out[i] = data[i];
+    uint tid = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.x;              // Q head index
+    uint head_dim = pc.pad0;
+    uint seq_len = pc.rows;                    // KV positions to attend over
+    uint n_q_heads = pc.cols;
+    uint n_kv_heads = pc.stride;
+    uint max_seq = floatBitsToUint(pc.param0);
+    uint position = pc.opt0;                   // current position (offset)
+
+    // GQA mapping
+    uint kv_head = head * n_kv_heads / n_q_heads;
+
+    float scale = 1.0 / sqrt(float(head_dim));
+
+    // Load Q (from data, already projected in MTP block)
+    float q_val = (tid < head_dim) ? data[head * head_dim + tid] : 0.0;
+
+    // Online softmax (no causal mask for MTP)
+    float max_score = -3.4e38;
+    float sum_exp = 0.0;
+    float acc = 0.0;
+
+    bool elem_active = tid < head_dim;
+
+    for (uint pos = 0u; pos < seq_len; pos++) {
+        // Read K from main model's K cache (Q4_0 in data16)
+        float k_val = 0.0;
+        if (elem_active) {
+            uint k_elem = (pos * n_kv_heads + kv_head) * head_dim + tid;
+            k_val = float(dequant_q4_0(0u, k_elem));
+        }
+
+        float partial = q_val * k_val;
+        float sg_sum = subgroup_sum(partial);
+
+        if (gl_SubgroupInvocationID == 0u) {
+            s_sg_tmp[gl_SubgroupID] = sg_sum;
+        }
+        barrier();
+        memoryBarrierShared();
+
+        if (tid == 0u) {
+            float total = 0.0;
+            for (uint i = 0u; i < 4u; i++) {
+                total += s_sg_tmp[i];
+            }
+            s_score = total * scale;
+        }
+        barrier();
+        memoryBarrierShared();
+
+        float score_val = s_score;
+
+        // Online softmax (no causal mask)
+        float new_max = max(max_score, score_val);
+        float old_scale = exp(max_score - new_max);
+        float exp_score = exp(score_val - new_max);
+
+        sum_exp = sum_exp * old_scale + exp_score;
+
+        // Read V from main model's V cache (Int8 in data8)
+        float v_val = 0.0;
+        if (elem_active) {
+            uint v_elem = (pos * n_kv_heads + kv_head) * head_dim + tid;
+            v_val = float(unpack_int8_v(v_elem));
+        }
+
+        acc = acc * old_scale + v_val * exp_score;
+        max_score = new_max;
+
+        barrier();
+    }
+
+    // Write normalized output to MTP output buffer
+    if (elem_active) {
+        float out_val = acc / sum_exp;
+        data_out[head * head_dim + tid] = out_val;
+    }
 }

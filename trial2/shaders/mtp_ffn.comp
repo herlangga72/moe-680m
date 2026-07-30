@@ -21,7 +21,65 @@ layout(set = 0, binding = 6) buffer Buf6 { float data_out[]; };
 #include "common.glsl"
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.rows) return;
-    data_out[i] = data[i];
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.cols;                    // hidden dimension
+    uint ffn_intermediate = pc.opt0;
+    uint row_offset = pc.rows;             // output row offset
+
+    // Temporary buffer for intermediate (first half of data_out or a global temp)
+    // We'll write gate and up to a temp area, then apply SiLU and multiply,
+    // then down-project, and finally residual-add.
+    //
+    // Since this is an MTP FFN (not MoE), it's a simple dense SwiGLU:
+    //   out = down(SiLU(gate(x)) * up(x)) + x
+    //
+    // We have three iQ4_XS weight matrices:
+    //   gate_w: ffn_intermediate × dim
+    //   up_w:   ffn_intermediate × dim
+    //   down_w: dim × ffn_intermediate
+    //
+    // The caller binds data16 to the appropriate position.
+
+    // ── Phase 1: Gate + Up projection ──
+    // Write both results to a contiguous temp area in data_out
+    // First ffn_intermediate elements = gate, next = up
+    uint ffn2 = ffn_intermediate * 2u;
+    for (uint j = tid; j < ffn2; j += 256u) {
+        float sum = 0.0;
+        if (j < ffn_intermediate) {
+            for (uint k = 0u; k < dim; k++) {
+                sum += data[k] * dequant_iq4_xs(0u, j * dim + k);
+            }
+        } else {
+            uint up_j = j - ffn_intermediate;
+            for (uint k = 0u; k < dim; k++) {
+                sum += data[k] * dequant_iq4_xs(0u, ffn_intermediate * dim + up_j * dim + k);
+            }
+        }
+        data_out[row_offset + j] = sum;
+    }
+    barrier();
+
+    // ── Phase 2: SiLU(gate) * up, in-place on first half ──
+    for (uint j = tid; j < ffn_intermediate; j += 256u) {
+        float gate = data_out[row_offset + j];
+        float up = data_out[row_offset + ffn_intermediate + j];
+        float sig = 1.0 / (1.0 + exp(-gate));
+        data_out[row_offset + j] = (gate * sig) * up; // activated intermediate
+    }
+    barrier();
+
+    // ── Phase 3: Down projection ──
+    // Read activated intermediate from data_out[row_offset..row_offset+ffn_intermediate)
+    // Write to temp (data, which still has the residual)
+    for (uint j = tid; j < dim; j += 256u) {
+        float sum = 0.0;
+        for (uint k = 0u; k < ffn_intermediate; k++) {
+            float act = data_out[row_offset + k];
+            sum += act * dequant_iq4_xs(0u, j * ffn_intermediate + k); // down weight
+        }
+
+        // ── Phase 4: Residual add ──
+        data_out[row_offset + ffn2 + j] = data[j] + sum; // data[j] is the saved residual
+    }
 }
