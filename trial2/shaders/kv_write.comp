@@ -7,6 +7,7 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -19,8 +20,85 @@ layout(set = 0, binding = 5) buffer Buf5 { float v_cache[]; };
 
 #include "common.glsl"
 
+shared float s_block[32];   // one Q4_0 block (32 FP32 values)
+
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.rows) return;
-    v_cache[i] = data[i];
+    uint tid = gl_LocalInvocationID.x;
+    uint head_dim = pc.pad0;
+    uint head = gl_WorkGroupID.x;       // KV head
+    uint n_kv_heads = pc.stride;
+    uint position = pc.opt0;            // write position in cache
+
+    uint n_blocks = (head_dim + 31u) / 32u;
+
+    // ── Phase 1: Write K cache (Q4_0 quantized) ──
+    // Each block of 32 elements shares one FP16 scale d; values are 4-bit nibbles offset by -8
+    for (uint b = 0u; b < n_blocks; b++) {
+        uint blk_start = b * 32u;
+
+        // Cooperative load: all 256 threads help load the block (32 elements)
+        uint local_idx = tid & 31u;
+        uint global_idx = blk_start + local_idx;
+        if (local_idx < 32u && global_idx < head_dim) {
+            uint cache_idx = (position * n_kv_heads + head) * head_dim + global_idx;
+            s_block[local_idx] = data[cache_idx];
+        } else if (local_idx < 32u) {
+            s_block[local_idx] = 0.0;
+        }
+        barrier();
+        memoryBarrierShared();
+
+        // Find max absolute value in block (subgroup 0 handles threads 0..31)
+        float abs_max = 0.0;
+        if (local_idx == 0u) {
+            for (uint i = 0u; i < min(32u, head_dim - blk_start); i++) {
+                abs_max = max(abs_max, abs(s_block[i]));
+            }
+        }
+
+        // Quantize and write Q4_0 block
+        if (local_idx == 0u) {
+            float d_val = abs_max / 8.0f;
+            if (d_val < 1e-10f) d_val = 1e-10f;
+            float inv_d = 1.0f / d_val;
+
+            // d as FP16
+            float16_t d_f16 = float16_t(d_val);
+
+            // Q4_0 block base in data16: 9 uint16 entries per block
+            uint blk_idx = position * n_kv_heads * n_blocks + head * n_blocks + b;
+            uint base = 9u * blk_idx;
+
+            // Write d
+            data16[base] = float16BitsToUint16(d_f16);
+
+            // Pack 32 4-bit values into 16 bytes (8 uint16 entries)
+            for (uint p = 0u; p < 32u; p += 2u) {
+                float qf0 = s_block[p] * inv_d + 8.0f;
+                int qi0 = int(round(qf0));
+                qi0 = clamp(qi0, 0, 15);
+
+                float qf1 = s_block[p + 1u] * inv_d + 8.0f;
+                int qi1 = int(round(qf1));
+                qi1 = clamp(qi1, 0, 15);
+
+                uint packed = uint(qi0) | (uint(qi1) << 4u);
+                data16[base + 1u + p / 2u] = uint16_t(packed);
+            }
+        }
+        barrier();
+    }
+
+    // ── Phase 2: Write V cache (Int8) ──
+    for (uint j = tid; j < head_dim; j += 256u) {
+        uint cache_idx = (position * n_kv_heads + head) * head_dim + j;
+        float v_val = data_v[cache_idx];
+
+        // Clamp to int8 range and round to nearest
+        int qi = int(round(v_val));
+        qi = clamp(qi, -128, 127);
+
+        // Write to data8 (1 byte per element)
+        data8[cache_idx] = uint8_t(qi & 0xFF);
+    }
 }

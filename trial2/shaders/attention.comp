@@ -21,8 +21,98 @@ layout(set = 0, binding = 7) buffer Buf7 { float data_out[]; };
 
 #include "common.glsl"
 
+shared float s_sg_tmp[4]; // cross-subgroup reduction temp
+shared float s_score;     // broadcast score for current KV position
+
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.rows) return;
-    data_out[i] = data[i];
+    uint tid = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.x;              // Q head index
+    uint head_dim = pc.pad0;
+    uint seq_len = pc.rows;                    // number of KV positions
+    uint n_q_heads = pc.cols;
+    uint n_kv_heads = pc.stride;
+    uint max_seq = floatBitsToUint(pc.param0); // max cached positions
+    uint is_prefill = pc.opt0;
+    uint position = pc.opt1;                   // current write position (used for causal mask)
+
+    // GQA: map Q head to KV head
+    uint kv_head = head * n_kv_heads / n_q_heads;
+
+    float scale = 1.0 / sqrt(float(head_dim));
+
+    // Load Q for this head (each thread holds one head_dim element)
+    float q_val = (tid < head_dim) ? data[head * head_dim + tid] : 0.0;
+
+    // Online softmax state (per-thread accumulator)
+    float max_score = -3.4e38; // -FLT_MAX
+    float sum_exp = 0.0;
+    float acc = 0.0;
+
+    bool elem_active = tid < head_dim;
+
+    for (uint pos = 0u; pos < seq_len; pos++) {
+        // ── K dequant (Q4_0) and partial dot product ──
+        float k_val = 0.0;
+        if (elem_active) {
+            uint k_elem = (pos * n_kv_heads + kv_head) * head_dim + tid;
+            k_val = float(dequant_q4_0(0u, k_elem));
+        }
+
+        float partial = q_val * k_val;
+
+        // Subgroup reduction within each Wave64
+        float sg_sum = subgroup_sum(partial);
+
+        // Cross-subgroup reduction via shared memory
+        if (gl_SubgroupInvocationID == 0u) {
+            s_sg_tmp[gl_SubgroupID] = sg_sum;
+        }
+        barrier();
+        memoryBarrierShared();
+
+        if (tid == 0u) {
+            float total = 0.0;
+            for (uint i = 0u; i < 4u; i++) {
+                total += s_sg_tmp[i];
+            }
+            total = total * scale;
+
+            // Causal mask
+            if (is_prefill != 0u && pos > position) {
+                total = -3.4e38;
+            }
+
+            s_score = total;
+        }
+        barrier();
+        memoryBarrierShared();
+
+        float score_val = s_score;
+
+        // ── Online safe softmax update ──
+        float new_max = max(max_score, score_val);
+        float old_scale = exp(max_score - new_max);
+        float exp_score = exp(score_val - new_max);
+
+        sum_exp = sum_exp * old_scale + exp_score;
+
+        // ── V load (Int8 cache) ──
+        float v_val = 0.0;
+        if (elem_active) {
+            uint v_elem = (pos * n_kv_heads + kv_head) * head_dim + tid;
+            v_val = float(unpack_int8_v(v_elem));
+        }
+
+        acc = acc * old_scale + v_val * exp_score;
+        max_score = new_max;
+
+        // Ensure all threads finish this iteration before next
+        barrier();
+    }
+
+    // ── Write normalized output ──
+    if (elem_active) {
+        float out_val = acc / sum_exp;
+        data_out[head * head_dim + tid] = out_val;
+    }
 }
