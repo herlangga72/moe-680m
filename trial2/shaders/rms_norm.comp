@@ -17,8 +17,52 @@ layout(set = 0, binding = 3) buffer Buf3 { float data_out[]; };
 
 #include "common.glsl"
 
+shared float s_sum_sq[4]; // 4 subgroups x 1 float
+
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.rows) return;
-    data_out[i] = data[i];
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.cols;
+    float eps = pc.param0;
+
+    // Row offset
+    uint base = row * dim;
+
+    // Sum of squares across row, stride by workgroup size
+    float sum_sq = 0.0;
+    for (uint j = tid; j < dim; j += 256u) {
+        float v = data[base + j];
+        sum_sq += v * v;
+    }
+
+    // Wave64 subgroup reduction (single cycle on RDNA2)
+    sum_sq = subgroup_sum(sum_sq);
+
+    // One thread per subgroup writes to shared memory
+    uint sg_id = gl_SubgroupID; // 0..3
+    if (gl_SubgroupInvocationID == 0u) {
+        s_sum_sq[sg_id] = sum_sq;
+    }
+    barrier();
+    memoryBarrierShared();
+
+    // Reduce across subgroups, store result in shared memory
+    if (sg_id == 0u) {
+        float total = 0.0;
+        for (uint s = 0u; s < 4u; s++) {
+            total += s_sum_sq[s];
+        }
+        s_sum_sq[0] = total;
+    }
+    barrier();
+
+    // All threads read the final value from shared memory
+    float total_sq = s_sum_sq[0];
+    float rms = rsqrt_fast(total_sq / float(dim) + eps);
+
+    // Apply: out = inp * weight * rms (with iQ4_XS dequant fused)
+    for (uint j = tid; j < dim; j += 256u) {
+        float w = dequant_iq4_xs(0u, j);
+        data_out[base + j] = data[base + j] * w * rms;
+    }
 }
