@@ -1,7 +1,9 @@
 mod constants;
 mod device;
+mod dispatch;
 mod error;
 mod gguf;
+mod kv_cache;
 mod memory;
 mod shaders;
 
