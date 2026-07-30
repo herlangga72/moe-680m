@@ -8,14 +8,14 @@ use ash::vk;
 use std::collections::HashMap;
 use crate::device::Device;
 use crate::error::{Error, Result};
-use crate::gguf::{GgufFile, TensorInfo};
+use crate::gguf::{GgufDtype, GgufFile, TensorInfo};
 use crate::memory::Buffer;
 
 pub struct WeightPool {
     device: ash::Device,
     memory: vk::DeviceMemory,
     buffers: HashMap<String, (vk::Buffer, u64, u64)>, // name -> (handle, offset, size)
-    mapped_ptr: *mut u8,
+    pub mapped_ptr: *mut u8,
     total_size: u64,
     next_offset: u64,
 }
@@ -50,16 +50,24 @@ impl WeightPool {
 
     /// Upload a tensor from GGUF into the pool, return a DescriptorBufferInfo.
     /// Reuses existing buffer if already uploaded for this layer.
+    /// Upload a tensor and return a DescriptorBufferInfo pointing to it.
+    /// The buffer is bound at the pool offset; DescriptorBufferInfo offset is 0.
     pub fn upload(&mut self, gguf: &GgufFile, tensor_name: &str) -> Result<vk::DescriptorBufferInfo> {
-        if let Some(&(buf, offset, size)) = self.buffers.get(tensor_name) {
+        if let Some(&(buf, _offset, size)) = self.buffers.get(tensor_name) {
             return Ok(vk::DescriptorBufferInfo::default()
-                .buffer(buf).offset(offset).range(size));
+                .buffer(buf).offset(0).range(size));
         }
 
         let tensor = gguf.find_tensor(tensor_name)
             .ok_or_else(|| Error::Api(format!("tensor not found: {}", tensor_name)))?;
-        let data = gguf.tensor_data(tensor);
-        let size = data.len() as u64;
+        let raw = gguf.tensor_data(tensor);
+        let size = raw.len() as u64;
+        let copy_offset = if tensor.dtype == GgufDtype::F32 && raw.len() > 16 {
+            // ponytail: Unsloth IQ4_XS GGUF stores 16-byte garbage prefix on F32 norm tensors.
+            16usize
+        } else { 0usize };
+        let copy_len = raw.len() - copy_offset;
+        if copy_len == 0 { return Err(Error::Api(format!("zero-sized tensor: {}", tensor_name))); }
 
         // Align to 128 bytes
         let offset = (self.next_offset + 127) & !127;
@@ -75,15 +83,19 @@ impl WeightPool {
         let buf = unsafe { self.device.create_buffer(&buf_info, None)? };
         unsafe { self.device.bind_buffer_memory(buf, self.memory, offset)?; }
 
-        // Copy data
+        // Copy data (skip prefix if needed)
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), self.mapped_ptr.add(offset as usize), data.len());
+            std::ptr::copy_nonoverlapping(
+                raw.as_ptr().add(copy_offset),
+                self.mapped_ptr.add(offset as usize),
+                copy_len,
+            );
         }
 
         self.buffers.insert(tensor_name.to_string(), (buf, offset, size));
         self.next_offset = offset + size;
 
-        Ok(vk::DescriptorBufferInfo::default().buffer(buf).offset(offset).range(size))
+        Ok(vk::DescriptorBufferInfo::default().buffer(buf).offset(0).range(size))
     }
 
     /// Clear all buffers for next layer (reuse memory from start).

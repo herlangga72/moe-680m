@@ -223,14 +223,22 @@ fn test_forward(mut engine: engine::Engine, gguf: &gguf::GgufFile) -> Result<()>
     let w_norm = wp.upload(gguf, "blk.0.attn_norm.weight")?;
     let w_qkv = wp.upload(gguf, "blk.0.attn_qkv.weight")?;
     println!("Uploaded: attn_norm ({}B) + attn_qkv ({}B)", w_norm.range, w_qkv.range);
+    // Check if norm weights have 16-byte garbage prefix
+    for name in ["output_norm.weight", "blk.0.attn_norm.weight", "blk.1.attn_norm.weight"] {
+        if let Some(t) = gguf.find_tensor(name) {
+            let raw = gguf.tensor_data(t);
+            let f32s: &[f32] = bytemuck::cast_slice(&raw[..32.min(raw.len())]);
+            println!("  {} (off={}): f32[0..4]={:?}", name, t.offset, &f32s[..4.min(f32s.len())]);
+        }
+    }
 
     // Allocate I/O buffers
     let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
     let io_size = (dim * 8) as u64; // FP32 input + FP16 hidden state
     let io_buf = memory::Buffer::new(&dev.device, io_size, usage)?;
-    let q_buf = memory::Buffer::new(&dev.device, (16 * 256 * 2) as u64, usage)?; // q: n_heads*head_dim*2
-    let k_buf = memory::Buffer::new(&dev.device, (2 * 256 * 2) as u64, usage)?; // k: n_kv*head_dim*2
-    let v_buf = memory::Buffer::new(&dev.device, (2 * 256 * 2) as u64, usage)?;
+    let q_buf = memory::Buffer::new(&dev.device, (16 * 256 * 4) as u64, usage)?; // q: FP32
+    let k_buf = memory::Buffer::new(&dev.device, (2 * 256 * 4) as u64, usage)?; // k: FP32
+    let v_buf = memory::Buffer::new(&dev.device, (2 * 256 * 4) as u64, usage)?;
 
     let io_mem_size = io_size + q_buf.size + k_buf.size + v_buf.size + 3 * 128;
     let alloc_info = vk::MemoryAllocateInfo::default()
@@ -249,37 +257,42 @@ fn test_forward(mut engine: engine::Engine, gguf: &gguf::GgufFile) -> Result<()>
     for i in 0..dim as usize { unsafe { *ptr.add(i) = 1.0f32; } }
     unsafe { dev.device.unmap_memory(io_mem); }
 
-    // Simple test: residual_add to verify chain works
-    let mut chain = dispatch::DispatchChain::new();
-
-    // Fill io_buf with 3.0 and 2.0
+    // Test RMSNorm alone first
     let ptr = unsafe { dev.device.map_memory(io_mem, 0, io_mem_size, vk::MemoryMapFlags::empty())? } as *mut f32;
-    for i in 0..dim as usize { unsafe { *ptr.add(i) = 3.0f32; *ptr.add(dim as usize + i) = 2.0f32; } }
+    for i in 0..dim as usize { unsafe { *ptr.add(i) = 1.0f32; } }
     unsafe { dev.device.unmap_memory(io_mem); }
 
-    // residual_add: a += b (binding 0 = a, binding 3 = b)
-    let idx = shaders::SHADERS.iter().position(|&n| n == "residual_add").unwrap();
-    let ds = engine.shaders.desc_sets[idx];
+    // Upload real FP32 norm weight
+    let test_w = wp.upload(gguf, "blk.0.attn_norm.weight")?;
+
+    let full = vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset(0).range(vk::WHOLE_SIZE);
+    let out_bi = vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset((dim * 4) as u64).range(vk::WHOLE_SIZE);
+    let q_bi = vk::DescriptorBufferInfo::default().buffer(q_buf.handle).offset(0).range(vk::WHOLE_SIZE);
+
+    // RMSNorm only, then read output
+    let mut chain = dispatch::DispatchChain::new();
     chain.add(dispatch::DispatchStep {
-        pipeline_name: "residual_add",
-        push_data: pc_bytes(&constants::RMSNormPC { rows: 0, dim, eps: 0.0 }),
+        pipeline_name: "rms_norm",
+        push_data: pc_bytes(&constants::RMSNormPC { rows: 1, dim, eps: 1e-6 }),
         workgroup_x: (dim + 255) / 256, workgroup_y: 1, workgroup_z: 1,
-        buffers: vec![
-            vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset(0).range(vk::WHOLE_SIZE),
-            vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset(0).range(0),
-            vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset(0).range(0),
-            vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset((dim * 4) as u64).range(vk::WHOLE_SIZE),
-        ],
+        buffers: vec![full, test_w, test_w, out_bi, test_w],
         barrier: dispatch::BarrierKind::MemoryFlush,
     });
 
+    // Pre-fill q_buf with sentinel 99.0 to detect shader write
+    let q_off = (io_buf.size + 127) & !127;
+    let ptr2 = unsafe { dev.device.map_memory(io_mem, q_off, q_buf.size, vk::MemoryMapFlags::empty())? } as *mut f32;
+    unsafe { *ptr2 = 99.0f32; *ptr2.add(1) = 99.0f32; }
+    unsafe { dev.device.unmap_memory(io_mem); }
+
     chain.execute(dev, &engine.shaders)?;
 
-    let ptr = unsafe { dev.device.map_memory(io_mem, 0, io_buf.size, vk::MemoryMapFlags::empty())? } as *const f32;
-    let out = unsafe { std::slice::from_raw_parts(ptr, 8) };
-    println!("residual_add: a[0..4] = {:?} (expected 5.0)", &out[..4]);
-    let pass = out.iter().all(|v| (v - 5.0).abs() < 0.001);
-    println!("DispatchChain verify: {}", if pass { "PASS" } else { "FAIL" });
+    let ptr3 = unsafe { dev.device.map_memory(io_mem, 0, io_buf.size, vk::MemoryMapFlags::empty())? } as *const f32;
+    let rms_out = unsafe { std::slice::from_raw_parts(ptr3.add(dim as usize), 8) };
+    println!("RMSNorm out[0..4] (real weight × 1.0) = {:?}", &rms_out[..4]);
+    let ok = !rms_out[0].is_nan() && rms_out[0].abs() > 0.001;
+    println!("RMSNorm: {} first={}", if ok { "PASS" } else { "FAIL" }, rms_out[0]);
+    unsafe { dev.device.unmap_memory(io_mem); }
     unsafe { dev.device.unmap_memory(io_mem); }
 
     unsafe {

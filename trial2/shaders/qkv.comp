@@ -34,12 +34,13 @@ void main() {
     for (uint j = tid; j < total; j += 256u) {
         float sum = 0.0;
         for (uint k = 0u; k < dim; k++) {
-            // pc.opt3 selects dequant: 0=FP32, 1=Q8_0, 2=IQ4_XS
             float w;
-            switch (pc.opt3) {
-                case 1u: w = dequant_q8_0(0u, j * dim + k); break;
-                case 2u: w = dequant_iq4_xs(0u, j * dim + k); break;
-                default: w = data[k]; break;
+            if (pc.opt3 == 1u) {
+                w = dequant_q8_0(0u, j * dim + k);
+            } else if (pc.opt3 == 2u) {
+                w = dequant_iq4_xs(0u, j * dim + k);
+            } else {
+                w = data[k]; // FP32 passthrough
             }
             sum += data[k] * w;
         }

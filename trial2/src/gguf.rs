@@ -157,11 +157,14 @@ impl GgufFile {
             });
         }
 
-        // Compute sizes (contiguous storage)
-        for i in 0..tensors.len() {
+        // Compute sizes: sort by file offset so adjacent entries are contiguous
+        let mut sorted: Vec<usize> = (0..tensors.len()).collect();
+        sorted.sort_by_key(|&i| tensors[i].offset);
+        for idx in 0..sorted.len() {
+            let i = sorted[idx];
             let this_offset = tensors[i].offset;
-            let next_offset = if i + 1 < tensors.len() {
-                tensors[i + 1].offset
+            let next_offset = if idx + 1 < sorted.len() {
+                tensors[sorted[idx + 1]].offset
             } else {
                 data.len() as u64
             };
