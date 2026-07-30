@@ -100,7 +100,7 @@ impl GgufFile {
         }
 
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        if magic != 0x46475547 { // "GGUF"
+        if magic != 0x46554747 { // "GGUF"
             return Err(Error::Gguf("bad magic — not a GGUF file".into()));
         }
 
@@ -115,11 +115,16 @@ impl GgufFile {
 
         // Parse key-value metadata
         let mut metadata = HashMap::new();
-        for _ in 0..n_kv {
-            let key = Self::read_string(&data, &mut pos)?;
+        for i in 0..n_kv {
+            let key = Self::read_string(&data, &mut pos)
+                .map_err(|e| Error::Gguf(format!("kv[{}] key read: {} at pos {}", i, e, pos)))?;
+            if pos + 4 > data.len() {
+                return Err(Error::Gguf(format!("kv[{}] val_type at pos {} OOB", i, pos)));
+            }
             let val_type = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
             pos += 4;
-            let val = Self::read_value(&data, &mut pos, val_type)?;
+            let val = Self::read_value(&data, &mut pos, val_type)
+                .map_err(|e| Error::Gguf(format!("kv[{}] key='{}' type={}: {}", i, key, val_type, e)))?;
             metadata.insert(key, val);
         }
 
@@ -186,28 +191,32 @@ impl GgufFile {
             }
         };
 
-        let n_heads_q = get_u32("qwen3.attention.head_count")?;
-        let n_heads_kv = get_u32("qwen3.attention.head_count_kv")?;
-        let hidden_dim = get_u32("qwen3.embedding_length")?;
-        let head_dim = hidden_dim / n_heads_q;
+        let arch = get_str("general.architecture").unwrap_or_default();
+        let prefix = if arch.contains("qwen") { &arch } else { "qwen3" };
+
+        let n_heads_q = get_u32(&format!("{}.attention.head_count", prefix))?;
+        let n_heads_kv = get_u32(&format!("{}.attention.head_count_kv", prefix))?;
+        let hidden_dim = get_u32(&format!("{}.embedding_length", prefix))?;
+        let head_dim = get_u32(&format!("{}.attention.key_length", prefix))
+            .unwrap_or(hidden_dim / n_heads_q);
 
         Ok(ModelConfig {
-            n_layers: get_u32("qwen3.block_count")?,
+            n_layers: get_u32(&format!("{}.block_count", prefix))?,
             hidden_dim,
             n_heads_q,
             n_heads_kv,
             head_dim,
-            ffn_intermediate: get_u32("qwen3.feed_forward_length")?,
-            n_experts: get_u32("qwen3.expert_count").unwrap_or(1),
-            n_active_experts: get_u32("qwen3.expert_used_count").unwrap_or(1),
-            n_shared_experts: get_u32("qwen3.expert_shared_count").unwrap_or(0),
-            vocab_size: get_u32("qwen3.vocab_size")?,
-            max_seq_len: get_u32("qwen3.context_length").unwrap_or(32768),
-            rope_theta: get_f32("qwen3.rope.freq_base").unwrap_or(1_000_000.0),
-            rope_type: get_str("qwen3.rope.type").unwrap_or_else(|_| "default".into()),
-            n_mtp_modules: get_u32("qwen3.mtp.module_count").unwrap_or(0),
-            mtp_depth: get_u32("qwen3.mtp.depth").unwrap_or(0),
-            eps: get_f32("qwen3.attention.layer_norm_rms_epsilon").unwrap_or(1e-6),
+            ffn_intermediate: get_u32(&format!("{}.expert_feed_forward_length", prefix))?,
+            n_experts: get_u32(&format!("{}.expert_count", prefix)).unwrap_or(1),
+            n_active_experts: get_u32(&format!("{}.expert_used_count", prefix)).unwrap_or(1),
+            n_shared_experts: get_u32(&format!("{}.expert_shared_count", prefix)).unwrap_or(0),
+            vocab_size: get_u32(&format!("{}.vocab_size", prefix))?,
+            max_seq_len: get_u32(&format!("{}.context_length", prefix)).unwrap_or(32768),
+            rope_theta: get_f32(&format!("{}.rope.freq_base", prefix)).unwrap_or(1_000_000.0),
+            rope_type: get_str(&format!("{}.rope.type", prefix)).unwrap_or_else(|_| "default".into()),
+            n_mtp_modules: get_u32(&format!("{}.nextn_predict_layers", prefix)).unwrap_or(0),
+            mtp_depth: get_u32(&format!("{}.nextn_predict_layers", prefix)).unwrap_or(0),
+            eps: get_f32(&format!("{}.attention.layer_norm_rms_epsilon", prefix)).unwrap_or(1e-6),
         })
     }
 
@@ -241,88 +250,71 @@ impl GgufFile {
     }
 
     fn read_value(data: &[u8], pos: &mut usize, val_type: u32) -> Result<GgufValue> {
-        match val_type {
-            1 => {
-                if *pos >= data.len() {
-                    return Err(Error::Gguf("truncated GGUF: U8 value out of bounds".into()));
-                }
-                let v = GgufValue::U8(data[*pos]);
-                *pos += 1;
-                Ok(v)
-            }
-            4 => {
-                if *pos + 4 > data.len() {
-                    return Err(Error::Gguf("truncated GGUF: U32 value out of bounds".into()));
-                }
-                let v = GgufValue::U32(u32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap()));
+        // GGUF v3 type codes:
+        // 0=u8, 1=i8, 2=u16, 3=i16, 4=u32, 5=i32, 6=f32, 7=bool,
+        // 8=string, 9=array, 10=u64, 11=i64, 12=f64
+        let check = |pos: &usize, n: usize| -> Result<()> {
+            if pos.checked_add(n).map_or(true, |e| e > data.len()) {
+                Err(Error::Gguf(format!("truncated at pos {} + {}", pos, n)))
+            } else { Ok(()) }
+        };
+        Ok(match val_type {
+            0 => { check(pos, 1)?; let v = GgufValue::U8(data[*pos]); *pos += 1; v }
+            1 => { check(pos, 1)?; let v = GgufValue::I32(data[*pos] as i8 as i32); *pos += 1; v }
+            2 => { check(pos, 2)?; let v = GgufValue::U32(u16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap()) as u32); *pos += 2; v }
+            3 => { check(pos, 2)?; let v = GgufValue::I32(i16::from_le_bytes(data[*pos..*pos+2].try_into().unwrap()) as i32); *pos += 2; v }
+            4 => { check(pos, 4)?; let v = GgufValue::U32(u32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap())); *pos += 4; v }
+            5 => { check(pos, 4)?; let v = GgufValue::I32(i32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap())); *pos += 4; v }
+            6 => { check(pos, 4)?; let v = GgufValue::F32(f32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap())); *pos += 4; v }
+            7 => { check(pos, 1)?; let v = GgufValue::Bool(data[*pos] != 0); *pos += 1; v }
+            8 => { GgufValue::String(Self::read_string(data, pos)?) }
+            9 => {
+                check(pos, 8)?;
+                let elem_type = u32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap());
                 *pos += 4;
-                Ok(v)
-            }
-            5 => {
-                if *pos + 8 > data.len() {
-                    return Err(Error::Gguf("truncated GGUF: U64 value out of bounds".into()));
-                }
-                let v = GgufValue::U64(u64::from_le_bytes(data[*pos..*pos+8].try_into().unwrap()));
+                let len = u64::from_le_bytes(data[*pos..*pos+8].try_into().unwrap()) as usize;
                 *pos += 8;
-                Ok(v)
+                // ponytail: array count is u64 in GGUF v3, not u32
+                Self::read_array(data, pos, elem_type, len)?
             }
-            7 => {
-                if *pos + 4 > data.len() {
-                    return Err(Error::Gguf("truncated GGUF: I32 value out of bounds".into()));
-                }
-                let v = GgufValue::I32(i32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap()));
-                *pos += 4;
-                Ok(v)
-            }
-            8 => {
-                if *pos + 8 > data.len() {
-                    return Err(Error::Gguf("truncated GGUF: I64 value out of bounds".into()));
-                }
-                let v = GgufValue::I64(i64::from_le_bytes(data[*pos..*pos+8].try_into().unwrap()));
-                *pos += 8;
-                Ok(v)
-            }
-            22 => {
-                if *pos + 4 > data.len() {
-                    return Err(Error::Gguf("truncated GGUF: F32 value out of bounds".into()));
-                }
-                let v = GgufValue::F32(f32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap()));
-                *pos += 4;
-                Ok(v)
-            }
-            23 => {
-                if *pos + 8 > data.len() {
-                    return Err(Error::Gguf("truncated GGUF: F64 value out of bounds".into()));
-                }
-                let v = GgufValue::F64(f64::from_le_bytes(data[*pos..*pos+8].try_into().unwrap()));
-                *pos += 8;
-                Ok(v)
-            }
-            26 => {
-                if *pos >= data.len() {
-                    return Err(Error::Gguf("truncated GGUF: Bool value out of bounds".into()));
-                }
-                let v = GgufValue::Bool(data[*pos] != 0);
-                *pos += 1;
-                Ok(v)
-            }
-            13 => { // array of u32
-                if *pos + 4 > data.len() {
-                    return Err(Error::Gguf("truncated GGUF: array length out of bounds".into()));
-                }
-                let len = u32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap()) as usize;
-                *pos += 4;
+            10 => { check(pos, 8)?; let v = GgufValue::U64(u64::from_le_bytes(data[*pos..*pos+8].try_into().unwrap())); *pos += 8; v }
+            11 => { check(pos, 8)?; let v = GgufValue::I64(i64::from_le_bytes(data[*pos..*pos+8].try_into().unwrap())); *pos += 8; v }
+            12 => { check(pos, 8)?; let v = GgufValue::F64(f64::from_le_bytes(data[*pos..*pos+8].try_into().unwrap())); *pos += 8; v }
+            _ => return Err(Error::Gguf(format!("unknown value type {} at pos {}", val_type, pos))),
+        })
+    }
+
+    fn read_array(data: &[u8], pos: &mut usize, elem_type: u32, len: usize) -> Result<GgufValue> {
+        match elem_type {
+            5 => { // i32 array
                 let mut arr = Vec::with_capacity(len);
                 for _ in 0..len {
-                    if *pos + 4 > data.len() {
-                        return Err(Error::Gguf("truncated GGUF: array element out of bounds".into()));
-                    }
-                    arr.push(u32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap()));
+                    arr.push(f32::from_bits(u32::from_le_bytes(data[*pos..*pos+4].try_into().unwrap())));
                     *pos += 4;
                 }
-                Ok(GgufValue::ArrayU32(arr))
+                Ok(GgufValue::ArrayF32(arr))
             }
-            _ => Err(Error::Gguf(format!("unknown value type {}", val_type))),
+            11 => { // i64 array
+                let mut arr = Vec::with_capacity(len);
+                for _ in 0..len {
+                    arr.push(i64::from_le_bytes(data[*pos..*pos+8].try_into().unwrap()));
+                    *pos += 8;
+                }
+                Ok(GgufValue::ArrayI64(arr))
+            }
+            8 => { // string array — skip, not used by our config
+                for _ in 0..len { Self::read_string(data, pos)?; }
+                Ok(GgufValue::ArrayU32(vec![]))
+            }
+            _ => {
+                // Skip unknown array element types
+                let elem_size = match elem_type {
+                    0|1|7 => 1, 2|3 => 2, 4|5|6 => 4, 10|11|12 => 8,
+                    _ => return Err(Error::Gguf(format!("unknown array elem type {}", elem_type))),
+                };
+                *pos += len * elem_size;
+                Ok(GgufValue::ArrayU32(vec![]))
+            }
         }
     }
 }
