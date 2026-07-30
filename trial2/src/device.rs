@@ -78,6 +78,20 @@ impl Device {
         })
     }
 
+    pub fn find_memory_type(&self, type_filter: u32, flags: vk::MemoryPropertyFlags) -> Result<u32> {
+        let mem_props = unsafe {
+            self.instance.get_physical_device_memory_properties(self.physical)
+        };
+        for i in 0..mem_props.memory_type_count {
+            if (type_filter & (1 << i)) != 0
+                && mem_props.memory_types[i as usize].property_flags.contains(flags)
+            {
+                return Ok(i);
+            }
+        }
+        Err(Error::Vulkan(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))
+    }
+
     pub fn destroy(&mut self) {
         unsafe {
             self.device.destroy_device(None);
