@@ -1,0 +1,34 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+// Alpha/beta/dt projection: hidden(2048 FP16) → alpha(32) + beta(32).
+// Push constants: rows=32 (out_dim), cols=2048 (in_dim)
+
+layout(push_constant, std430) uniform PC { uint rows; uint cols; uint pad0; uint pad1; float p0; float p1; float p2; float p3; uint o0; uint o1; uint o2; uint o3; } pc;
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer Input       { float16_t inp[]; };
+layout(set = 0, binding = 1, std430) buffer AlphaWeight { float     aw[]; };  // [2048, 32]
+layout(set = 0, binding = 2, std430) buffer BetaWeight  { float     bw[]; };  // [2048, 32]
+layout(set = 0, binding = 3, std430) buffer AlphaOut    { float16_t ao[]; };  // 32
+layout(set = 0, binding = 4, std430) buffer BetaOut     { float16_t bo[]; };  // 32
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint out_dim = pc.rows;  // 32
+    uint in_dim = pc.cols;   // 2048
+
+    if (tid >= out_dim) return;
+
+    float asum = 0.0, bsum = 0.0;
+    for (uint i = 0u; i < in_dim; i++) {
+        float v = float(inp[i]);
+        asum += v * aw[tid * in_dim + i];
+        bsum += v * bw[tid * in_dim + i];
+    }
+    ao[tid] = float16_t(asum);
+    bo[tid] = float16_t(bsum);
+}

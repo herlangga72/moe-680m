@@ -1,0 +1,44 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+// SSM depthwise conv1d — kernel=4, channels=8192 (4×dim).
+// Causal: only looks at past tokens. Maintains conv state buffer.
+//
+// Push constants: rows=kernel(4), cols=channels(8192)
+
+layout(push_constant, std430) uniform PC { uint rows; uint cols; uint pad0; uint pad1; float p0; float p1; float p2; float p3; uint o0; uint o1; uint o2; uint o3; } pc;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer Input     { float16_t x[]; };       // 8192
+layout(set = 0, binding = 1, std430) buffer ConvW     { float     w[]; };       // [4, 8192]
+layout(set = 0, binding = 2, std430) buffer ConvState { float16_t cs[]; };      // [3, 8192]
+layout(set = 0, binding = 3, std430) buffer OutBuf    { float16_t y[]; };       // 8192
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint ch = gl_WorkGroupID.x * 256u + tid;
+    if (ch >= 8192u) return;
+
+    uint kernel = pc.rows; // 4
+
+    // Load current + past
+    float16_t x0 = x[ch];
+    float16_t x1 = cs[0u * 8192u + ch];
+    float16_t x2 = cs[1u * 8192u + ch];
+    float16_t x3 = cs[2u * 8192u + ch];
+
+    float sum = float(x0) * w[0u * 8192u + ch]
+              + float(x1) * w[1u * 8192u + ch]
+              + float(x2) * w[2u * 8192u + ch]
+              + float(x3) * w[3u * 8192u + ch];
+
+    y[ch] = float16_t(sum);
+
+    // Shift state: oldest out, current in
+    cs[2u * 8192u + ch] = x2;
+    cs[1u * 8192u + ch] = x1;
+    cs[0u * 8192u + ch] = x0;
+}

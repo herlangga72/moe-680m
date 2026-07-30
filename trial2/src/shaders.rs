@@ -12,6 +12,7 @@ pub const SHADERS: &[&str] = &[
     "residual_add", "router_topk", "moe_gate_up", "silu_mult",
     "moe_down", "moe_combine", "lm_head", "sample",
     "mtp_concat_norm", "mtp_attention", "mtp_ffn", "mtp_head",
+    "ssm_norm", "ssm_conv", "ssm_scan", "ssm_proj", "ssm_out",
 ];
 
 pub struct ShaderCache {

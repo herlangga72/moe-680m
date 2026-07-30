@@ -1,0 +1,53 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+// Group RMS norm: weight[128] tiled across 16 groups (2048/128=16).
+// Push constants: rows=128 (group size), cols=2048 (dim), param0=eps
+
+layout(push_constant, std430) uniform PC { uint rows; uint cols; uint pad0; uint pad1; float p0; float p1; float p2; float p3; uint o0; uint o1; uint o2; uint o3; } pc;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer Input  { float16_t inp[]; };
+layout(set = 0, binding = 1, std430) buffer Weight { float     w[]; };
+layout(set = 0, binding = 2, std430) buffer OutBuf { float16_t out_data[]; };
+
+shared float s_rms[16];
+
+float subgroup_sum(float v) { return subgroupAdd(v); }
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.cols;
+    uint group_sz = pc.rows;
+    float eps = pc.p0;
+    uint n_groups = dim / group_sz;
+    uint thr_per_group = 256u / n_groups; // 16
+
+    uint gid = tid / thr_per_group;
+    uint local_tid = tid % thr_per_group;
+
+    // Sum-of-squares per group
+    float sum_sq = 0.0;
+    for (uint j = local_tid; j < group_sz; j += thr_per_group) {
+        float v = float(inp[gid * group_sz + j]);
+        sum_sq += v * v;
+    }
+    sum_sq = subgroup_sum(sum_sq);
+    if (local_tid == 0u) {
+        s_rms[gid] = inversesqrt(sum_sq / float(group_sz) + eps);
+    }
+    barrier();
+    memoryBarrierShared();
+
+    // Apply weight * rms
+    float rms = s_rms[gid];
+    for (uint j = local_tid; j < group_sz; j += thr_per_group) {
+        uint idx = gid * group_sz + j;
+        out_data[idx] = float16_t(float(inp[idx]) * w[j] * rms);
+    }
+}

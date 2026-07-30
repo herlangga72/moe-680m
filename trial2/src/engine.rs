@@ -151,7 +151,7 @@ impl Engine {
     fn build_layer_chain(
         &self,
         chain: &mut DispatchChain,
-        _layer: u32,
+        layer: u32,
         seq_len: u32,
         _is_prefill: bool,
     ) {
@@ -160,6 +160,62 @@ impl Engine {
         let n_kv = self.config.n_heads_kv;
         let n_active = self.config.n_active_experts;
         let head_dim = self.config.head_dim;
+        let full_attn_interval = 4u32; // every 4th layer is full attention
+        let is_full_attn = (layer % full_attn_interval) == 0;
+
+        // ── SSM branch (all layers have SSM weights) ──
+        {
+            // SSM pre-norm (group RMS, 128-element weight tiled 16×)
+            chain.add(DispatchStep {
+                pipeline_name: "ssm_norm",
+                push_data: pc_bytes(&RMSNormPC { rows: 128, dim, eps: self.config.eps }),
+                workgroup_x: 1, workgroup_y: 1, workgroup_z: 1,
+                buffers: vec![],
+                barrier: BarrierKind::ExecOnly,
+            });
+
+            // Alpha/beta projection (hidden → alpha[32], beta[32])
+            chain.add(DispatchStep {
+                pipeline_name: "ssm_proj",
+                push_data: pc_bytes(&RMSNormPC { rows: 32, dim, eps: 0.0 }),
+                workgroup_x: 1, workgroup_y: 1, workgroup_z: 1,
+                buffers: vec![],
+                barrier: BarrierKind::ExecOnly,
+            });
+
+            // Conv1d (kernel=4, 8192 channels)
+            chain.add(DispatchStep {
+                pipeline_name: "ssm_conv",
+                push_data: pc_bytes(&RMSNormPC { rows: 4, dim: 8192, eps: 0.0 }),
+                workgroup_x: div_up(8192, 256), workgroup_y: 1, workgroup_z: 1,
+                buffers: vec![],
+                barrier: BarrierKind::ExecOnly,
+            });
+
+            // Selective scan (16 groups, 32 state dim, 256 ch/group)
+            chain.add(DispatchStep {
+                pipeline_name: "ssm_scan",
+                push_data: pc_bytes(&RMSNormPC { rows: 32, dim: 16, eps: 256.0 }),
+                workgroup_x: 16, workgroup_y: 1, workgroup_z: 1,
+                buffers: vec![],
+                barrier: BarrierKind::ExecOnly,
+            });
+
+            // Output projection (4096 → 2048)
+            chain.add(DispatchStep {
+                pipeline_name: "ssm_out",
+                push_data: pc_bytes(&RMSNormPC { rows: dim, dim: 4096, eps: 0.0 }),
+                workgroup_x: div_up(dim, 256), workgroup_y: 1, workgroup_z: 1,
+                buffers: vec![],
+                barrier: BarrierKind::ExecOnly,
+            });
+        }
+
+        // ── Attention branch ──
+        if is_full_attn {
+            // Full attention (every 4th layer): Q/K separate projections + QK norms
+            // ponytail: use existing qkv/attention shaders for now; full-attn variant TBD
+        }
 
         // ---- 1. RMSNorm (pre-attention) ----
         chain.add(DispatchStep {

@@ -1,0 +1,35 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_8bit_storage : enable
+
+// SSM output projection: inner_size → dim (4096 → 2048), Q8_0 weight.
+
+layout(push_constant, std430) uniform PC { uint rows; uint cols; uint pad0; uint pad1; float p0; float p1; float p2; float p3; uint o0; uint o1; uint o2; uint o3; } pc;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer Input  { float16_t inp[]; };
+layout(set = 0, binding = 1, std430) buffer Weight { uint8_t   w[]; };
+layout(set = 0, binding = 2, std430) buffer OutBuf { float16_t out_data[]; };
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint in_dim = pc.cols;   // 4096
+    uint out_dim = pc.rows;  // 2048
+
+    for (uint j = tid; j < out_dim; j += 256u) {
+        float sum = 0.0;
+        for (uint k = 0u; k < in_dim; k++) {
+            // Q8_0: 32 elements per block, block = [d(FP16), q8s(32 bytes)]
+            uint blk = j * in_dim + k; // row j, col k
+            uint blk_off = (blk / 32u) * 34u;
+            uint d_word = uint(w[blk_off]) | (uint(w[blk_off + 1u]) << 8u);
+            float d = unpackFloat2x16(d_word).x;
+            float wval = d * (float(int(w[blk_off + 2u + (k % 32u)])) - 127.0);
+            sum += float(inp[k]) * wval;
+        }
+        out_data[j] = float16_t(sum);
+    }
+}

@@ -1,0 +1,56 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+// SSM selective scan (Mamba-2 style).
+// n_groups=16, state_sz=32, ch_per_group=256 (4096/16).
+//
+// Per group, per channel:
+//   h[t] = exp(A * softplus(alpha + bias)) * h[t-1] + beta * x[t]
+//   y[t] = sum_s(h[t])  (C=1 simplification)
+//
+// Push constants: rows=32 (state_sz), cols=16 (n_groups), p0=256 (ch_per_group)
+
+layout(push_constant, std430) uniform PC { uint rows; uint cols; uint pad0; uint pad1; float p0; float p1; float p2; float p3; uint o0; uint o1; uint o2; uint o3; } pc;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer X        { float16_t x[]; };
+layout(set = 0, binding = 1, std430) buffer A_data   { float     a[]; };        // [32]
+layout(set = 0, binding = 2, std430) buffer Alpha    { float16_t ai[]; };       // [32]
+layout(set = 0, binding = 3, std430) buffer Beta     { float16_t bi[]; };       // [32]
+layout(set = 0, binding = 4, std430) buffer DtBias   { float     db[]; };       // [32]
+layout(set = 0, binding = 5, std430) buffer State    { float     h[]; };        // [16*256*32]
+layout(set = 0, binding = 6, std430) buffer OutBuf   { float16_t y[]; };        // [4096]
+
+void main() {
+    uint gid = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint state_sz = pc.rows;      // 32
+    uint n_groups = pc.cols;      // 16
+    uint ch_per_group = uint(pc.p0); // 256
+
+    uint ch = tid;
+    if (ch >= ch_per_group) return;
+
+    uint ch_global = gid * ch_per_group + ch;
+    float16_t x_val = x[ch_global];
+    uint state_base = (gid * ch_per_group + ch) * state_sz;
+
+    float acc = 0.0;
+    for (uint s = 0u; s < state_sz; s++) {
+        float a_val  = a[s];
+        float al     = float(ai[s]);
+        float be     = float(bi[s]);
+        float dt     = log(1.0 + exp(al + db[s])); // softplus
+        float a_bar  = exp(a_val * dt);
+
+        float h_prev = h[state_base + s];
+        float h_new  = a_bar * h_prev + be * float(x_val);
+        h[state_base + s] = h_new;
+        acc += h_new;
+    }
+
+    y[ch_global] = float16_t(acc);
+}
