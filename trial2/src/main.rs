@@ -178,7 +178,8 @@ fn main() -> Result<()> {
     }
 
     // ---- 7. Load tokenizer ----
-    let tok = tokenizer::Tokenizer::new(&model_path)?;
+    let model_dir = model_path.parent().unwrap_or(std::path::Path::new("."));
+    let tok = tokenizer::Tokenizer::new(model_dir)?;
     println!("Tokenizer: loaded");
 
     // ---- 8. Start API server ----
@@ -219,11 +220,12 @@ fn test_forward(mut engine: engine::Engine, gguf: &gguf::GgufFile) -> Result<()>
     let n_kv = engine.config.n_heads_kv;
     let hd = engine.config.head_dim;
 
-    // Upload layer-0 attention weights
+    // Upload layer-0 attention weights + post-attn norm
     let mut wp = weights::WeightPool::new(dev, 128 * 1024 * 1024)?;
-    let w_norm = wp.upload(gguf, "blk.0.attn_norm.weight")?;
+    let w_pre_norm = wp.upload(gguf, "blk.0.attn_norm.weight")?;
     let w_qkv = wp.upload(gguf, "blk.0.attn_qkv.weight")?;
-    println!("Weights: attn_norm {}B + attn_qkv {}B", w_norm.range, w_qkv.range);
+    let w_post_norm = wp.upload(gguf, "blk.0.post_attention_norm.weight")?;
+    println!("Weights: pre_norm {}B + qkv {}B + post_norm {}B", w_pre_norm.range, w_qkv.range, w_post_norm.range);
 
     // Allocate I/O buffers: hidden (FP32), q/k/v (FP32), attn_out (FP16)
     let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
@@ -283,7 +285,7 @@ fn test_forward(mut engine: engine::Engine, gguf: &gguf::GgufFile) -> Result<()>
         pipeline_name: "rms_norm",
         push_data: pc_bytes(&constants::RMSNormPC { rows: 1, dim, eps: 1e-6 }),
         workgroup_x: (dim + 255) / 256, workgroup_y: 1, workgroup_z: 1,
-        buffers: vec![hi(), w_norm, w_norm, hi(), w_norm], // in=data, weight=wf32, out=data (in-place)
+        buffers: vec![hi(), w_pre_norm, w_pre_norm, hi(), w_pre_norm], // in=data, weight=wf32, out=data (in-place)
         barrier: ex,
     });
     chain.add(dispatch::DispatchStep { // 2. QKV
@@ -319,6 +321,13 @@ fn test_forward(mut engine: engine::Engine, gguf: &gguf::GgufFile) -> Result<()>
         push_data: pc_bytes(&constants::RMSNormPC { rows: 0, dim, eps: 0.0 }),
         workgroup_x: (dim + 255) / 256, workgroup_y: 1, workgroup_z: 1,
         buffers: vec![hi(), ai(), ai(), ai()], // data=a, data8, data16, data_b=attn_out
+        barrier: ex,
+    });
+    chain.add(dispatch::DispatchStep { // 7. Post-attention RMSNorm (pre-MoE)
+        pipeline_name: "rms_norm",
+        push_data: pc_bytes(&constants::RMSNormPC { rows: 1, dim, eps: 1e-6 }),
+        workgroup_x: (dim + 255) / 256, workgroup_y: 1, workgroup_z: 1,
+        buffers: vec![hi(), w_post_norm, w_post_norm, hi(), w_post_norm], // in-place
         barrier: mf,
     });
 
