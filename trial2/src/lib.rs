@@ -11,3 +11,4 @@ pub mod memory;
 pub mod mtp;
 pub mod shaders;
 pub mod tokenizer;
+pub mod weights;

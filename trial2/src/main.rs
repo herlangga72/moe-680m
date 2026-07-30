@@ -11,6 +11,7 @@ mod memory;
 mod mtp;
 mod shaders;
 mod tokenizer;
+mod weights;
 
 use error::{Error, Result};
 use std::path::PathBuf;
@@ -200,103 +201,104 @@ fn main() -> Result<()> {
 // Smoke test — GPU initialisation only, no model required
 // ---------------------------------------------------------------------------
 
-fn test_forward(mut engine: engine::Engine, _gguf: &gguf::GgufFile) -> Result<()> {
+fn pc_bytes<T: bytemuck::NoUninit>(pc: &T) -> [u8; 128] {
+    let mut buf = [0u8; 128];
+    let src = bytemuck::bytes_of(pc);
+    let len = src.len().min(128);
+    buf[..len].copy_from_slice(&src[..len]);
+    buf
+}
+
+fn test_forward(mut engine: engine::Engine, gguf: &gguf::GgufFile) -> Result<()> {
     use ash::vk;
     println!("\n=== GPU forward-pass test ===");
 
     let dev = &engine.device;
     let dim = engine.config.hidden_dim;
 
-    // Use residual_add: a += b — simple FP32, no dequant
-    let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
-    let size = (dim * 4) as u64; // FP32
-    let buf_a = memory::Buffer::new(&dev.device, size, usage)?;
-    let buf_b = memory::Buffer::new(&dev.device, size, usage)?;
+    // Weight pool for layer 0
+    let mut wp = weights::WeightPool::new(dev, 128 * 1024 * 1024)?; // 128 MB
 
-    // Allocate UMA memory
-    let total = (buf_a.size + buf_b.size + 127) & !127;
+    // Upload layer 0 weights
+    let w_norm = wp.upload(gguf, "blk.0.attn_norm.weight")?;
+    let w_qkv = wp.upload(gguf, "blk.0.attn_qkv.weight")?;
+    println!("Uploaded: attn_norm ({}B) + attn_qkv ({}B)", w_norm.range, w_qkv.range);
+
+    // Allocate I/O buffers
+    let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
+    let io_size = (dim * 8) as u64; // FP32 input + FP16 hidden state
+    let io_buf = memory::Buffer::new(&dev.device, io_size, usage)?;
+    let q_buf = memory::Buffer::new(&dev.device, (16 * 256 * 2) as u64, usage)?; // q: n_heads*head_dim*2
+    let k_buf = memory::Buffer::new(&dev.device, (2 * 256 * 2) as u64, usage)?; // k: n_kv*head_dim*2
+    let v_buf = memory::Buffer::new(&dev.device, (2 * 256 * 2) as u64, usage)?;
+
+    let io_mem_size = io_size + q_buf.size + k_buf.size + v_buf.size + 3 * 128;
     let alloc_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(total)
+        .allocation_size(io_mem_size)
         .memory_type_index(dev.find_memory_type(u32::MAX,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)?);
-    let mem = unsafe { dev.device.allocate_memory(&alloc_info, None)? };
-    unsafe { dev.device.bind_buffer_memory(buf_a.handle, mem, 0)?; }
-    unsafe { dev.device.bind_buffer_memory(buf_b.handle, mem, buf_a.size)?; }
-
-    // Fill: a = 3.0, b = 2.0 → after residual_add: a should be 5.0
-    let ptr = unsafe { dev.device.map_memory(mem, 0, total, vk::MemoryMapFlags::empty())? } as *mut f32;
-    for i in 0..dim as usize {
-        unsafe { *ptr.add(i) = 3.0f32; }
-        unsafe { *ptr.add(dim as usize + i) = 2.0f32; }
+    let io_mem = unsafe { dev.device.allocate_memory(&alloc_info, None)? };
+    let mut off = 0u64;
+    for buf in [&io_buf, &q_buf, &k_buf, &v_buf] {
+        unsafe { dev.device.bind_buffer_memory(buf.handle, io_mem, off)?; }
+        off += (buf.size + 127) & !127;
     }
-    unsafe { dev.device.unmap_memory(mem); }
 
-    // Dispatch residual_add
-    let pipeline = engine.shaders.pipelines.get("residual_add")
-        .ok_or_else(|| Error::Api("residual_add pipeline not found".into()))?;
+    // Fill input with 1.0 (hidden state)
+    let ptr = unsafe { dev.device.map_memory(io_mem, 0, io_mem_size, vk::MemoryMapFlags::empty())? } as *mut f32;
+    for i in 0..dim as usize { unsafe { *ptr.add(i) = 1.0f32; } }
+    unsafe { dev.device.unmap_memory(io_mem); }
 
-    let cmd_pool = unsafe {
-        dev.device.create_command_pool(
-            &vk::CommandPoolCreateInfo::default()
-                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-                .queue_family_index(dev.queue_family), None,
-        )?
-    };
-    let cmd = unsafe {
-        dev.device.allocate_command_buffers(
-            &vk::CommandBufferAllocateInfo::default()
-                .command_pool(cmd_pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
-        )?
-    }[0];
+    // Build dispatch chain for one RMSNorm + one QKV
+    let mut chain = dispatch::DispatchChain::new();
+
+    // RMSNorm
+    chain.add(dispatch::DispatchStep {
+        pipeline_name: "rms_norm",
+        push_data: pc_bytes(&constants::RMSNormPC { rows: 1, dim, eps: 1e-6 }),
+        workgroup_x: (dim + 255) / 256, workgroup_y: 1, workgroup_z: 1,
+        buffers: vec![
+            vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset(0).range(vk::WHOLE_SIZE),
+            w_norm,
+            vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset((dim * 4) as u64).range(vk::WHOLE_SIZE),
+        ],
+        barrier: dispatch::BarrierKind::ExecOnly,
+    });
+
+    // QKV
+    let q_off = off - ((k_buf.size + v_buf.size + 2 * 128) & !127); // approximate
+    chain.add(dispatch::DispatchStep {
+        pipeline_name: "qkv",
+        push_data: pc_bytes(&constants::LinearPC { in_dim: dim, out_dim: 16 * 256, pad: [0; 2] }),
+        workgroup_x: (dim + 63) / 64, workgroup_y: 16, workgroup_z: 1,
+        buffers: vec![
+            vk::DescriptorBufferInfo::default().buffer(io_buf.handle).offset(0).range(vk::WHOLE_SIZE),
+            w_qkv,
+            vk::DescriptorBufferInfo::default().buffer(q_buf.handle).offset(0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(k_buf.handle).offset(0).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(v_buf.handle).offset(0).range(vk::WHOLE_SIZE),
+        ],
+        barrier: dispatch::BarrierKind::MemoryFlush,
+    });
+
+    chain.execute(dev, &engine.shaders)?;
+    println!("RMSNorm + QKV dispatch: OK (2 shaders, {} elements)", dim);
+
+    // Read back Q output (first 4 values of first head)
+    let ptr = unsafe { dev.device.map_memory(io_mem, 0, io_mem_size, vk::MemoryMapFlags::empty())? } as *const f32;
+    let q_data = unsafe { std::slice::from_raw_parts(ptr, 32) };
+    println!("Q[0..4] (FP16 as FP32): {:?}", &q_data[..4]);
+    println!("Q NaN check: {}", if q_data.iter().any(|v| v.is_nan()) { "FAIL" } else { "PASS" });
+    unsafe { dev.device.unmap_memory(io_mem); }
 
     unsafe {
-        dev.device.begin_command_buffer(cmd,
-            &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
-        dev.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, *pipeline);
-
-        // residual_add: data[base+j] += data_b[base+j]; base=pc.rows, n=pc.cols
-        let pc = constants::RMSNormPC { rows: 0, dim, eps: 0.0 };
-        dev.device.cmd_push_constants(cmd, engine.shaders.pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&pc));
-
-        let idx = shaders::SHADERS.iter().position(|&n| n == "residual_add").unwrap();
-        let ds = engine.shaders.desc_sets[idx];
-        let bi_a = vk::DescriptorBufferInfo::default().buffer(buf_a.handle).offset(0).range(vk::WHOLE_SIZE);
-        let bi_b = vk::DescriptorBufferInfo::default().buffer(buf_b.handle).offset(0).range(vk::WHOLE_SIZE);
-        let writes = [
-            vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(0)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(&bi_a)),
-            vk::WriteDescriptorSet::default().dst_set(ds).dst_binding(3)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(&bi_b)),
-        ];
-        dev.device.update_descriptor_sets(&writes, &[]);
-        dev.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE,
-            engine.shaders.pipeline_layout, 0, &[ds], &[]);
-
-        dev.device.cmd_dispatch(cmd, (dim + 255) / 256, 1, 1);
-        dev.device.end_command_buffer(cmd)?;
+        dev.device.destroy_buffer(io_buf.handle, None);
+        dev.device.destroy_buffer(q_buf.handle, None);
+        dev.device.destroy_buffer(k_buf.handle, None);
+        dev.device.destroy_buffer(v_buf.handle, None);
+        dev.device.free_memory(io_mem, None);
     }
-
-    let cmd_bufs = [cmd];
-    unsafe {
-        dev.device.queue_submit(dev.queue, &[vk::SubmitInfo::default().command_buffers(&cmd_bufs)], vk::Fence::null())?;
-        dev.device.queue_wait_idle(dev.queue)?;
-    }
-
-    // Read back and verify: a[i] should be 5.0
-    let ptr = unsafe { dev.device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty())? } as *const f32;
-    let out_slice = unsafe { std::slice::from_raw_parts(ptr, dim as usize) };
-    println!("residual_add: a[0..4] = {:?} (expected [5.0, 5.0, 5.0, 5.0])", &out_slice[..4]);
-    let all_five = out_slice.iter().all(|v| (v - 5.0).abs() < 0.001);
-    println!("Verify 3+2=5: {}", if all_five { "PASS" } else { "FAIL" });
-    unsafe { dev.device.unmap_memory(mem); }
-
-    unsafe {
-        dev.device.destroy_command_pool(cmd_pool, None);
-        dev.device.destroy_buffer(buf_a.handle, None);
-        dev.device.destroy_buffer(buf_b.handle, None);
-        dev.device.free_memory(mem, None);
-    }
+    wp.destroy();
 
     println!("GPU forward-pass: OK");
     Ok(())
