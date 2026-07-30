@@ -19,8 +19,58 @@ layout(set = 0, binding = 5) buffer Buf5 { float data_out[]; };
 
 #include "common.glsl"
 
+shared float s_sg_sums[4]; // cross-subgroup reduction for RMS sum-of-squares
+shared float s_rms_val;    // broadcast RMS value
+
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.rows) return;
-    data_out[i] = data[i];
+    uint tid = gl_LocalInvocationID.x;
+    uint dim = pc.cols;                    // hidden dimension
+    uint vocab_size = pc.stride;
+    float eps = pc.param0;
+    uint row_offset = pc.rows;             // row offset in input
+
+    // ── RMSNorm on hidden state ──
+    // data[row_offset..row_offset+dim) is the input hidden state
+    // norm_w[i] are the RMSNorm weight parameters
+
+    float sum_sq = 0.0;
+    for (uint j = tid; j < dim; j += 256u) {
+        float v = data[row_offset + j];
+        sum_sq += v * v;
+    }
+
+    // Subgroup reduction
+    float sg_sum = subgroup_sum(sum_sq);
+
+    // Cross-subgroup via shared memory
+    if (gl_SubgroupInvocationID == 0u) {
+        s_sg_sums[gl_SubgroupID] = sg_sum;
+    }
+    barrier();
+    memoryBarrierShared();
+
+    if (tid == 0u) {
+        float total = 0.0;
+        for (uint i = 0u; i < 4u; i++) {
+            total += s_sg_sums[i];
+        }
+        s_rms_val = rsqrt_fast(total / float(dim) + eps);
+    }
+    barrier();
+    memoryBarrierShared();
+
+    float rms = s_rms_val;
+
+    // ── Linear projection: vocab × dim (iQ4_XS) ──
+    // output[0..vocab_size) = RMSNorm(hidden) × output_weight^T
+    // output_weight is vocab_size × dim
+
+    for (uint j = tid; j < vocab_size; j += 256u) {
+        float sum = 0.0;
+        for (uint k = 0u; k < dim; k++) {
+            float h = data[row_offset + k] * norm_w[k] * rms;
+            sum += h * dequant_iq4_xs(0u, j * dim + k);
+        }
+        data_out[j] = sum;
+    }
 }
