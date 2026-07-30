@@ -206,11 +206,27 @@ impl GgufFile {
             n_heads_q,
             n_heads_kv,
             head_dim,
-            ffn_intermediate: get_u32(&format!("{}.expert_feed_forward_length", prefix))?,
+            ffn_intermediate: get_u32(&format!("{}.expert_feed_forward_length", prefix))
+                .or_else(|_| get_u32(&format!("{}.feed_forward_length", prefix)))
+                .unwrap_or(hidden_dim * 4),
             n_experts: get_u32(&format!("{}.expert_count", prefix)).unwrap_or(1),
             n_active_experts: get_u32(&format!("{}.expert_used_count", prefix)).unwrap_or(1),
             n_shared_experts: get_u32(&format!("{}.expert_shared_count", prefix)).unwrap_or(0),
-            vocab_size: get_u32(&format!("{}.vocab_size", prefix))?,
+            vocab_size: {
+                let from_meta = get_u32(&format!("{}.vocab_size", prefix));
+                from_meta.unwrap_or_else(|_| {
+                    // token_embd.weight shape is [dim, vocab] or [vocab, dim]
+                    self.find_tensor("token_embd.weight")
+                        .and_then(|t| {
+                            let s0 = t.shape.first().copied().unwrap_or(0);
+                            let s1 = t.shape.get(1).copied().unwrap_or(0);
+                            if s0 as u32 == hidden_dim { Some(s1 as u32) }
+                            else if s1 as u32 == hidden_dim { Some(s0 as u32) }
+                            else { Some(s0.max(s1) as u32) }
+                        })
+                        .unwrap_or(0)
+                })
+            },
             max_seq_len: get_u32(&format!("{}.context_length", prefix)).unwrap_or(32768),
             rope_theta: get_f32(&format!("{}.rope.freq_base", prefix)).unwrap_or(1_000_000.0),
             rope_type: get_str(&format!("{}.rope.type", prefix)).unwrap_or_else(|_| "default".into()),
