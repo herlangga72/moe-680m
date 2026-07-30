@@ -18,7 +18,45 @@ layout(set = 0, binding = 3) buffer Buf3 { float data_k[]; };
 #include "common.glsl"
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.rows) return;
-    data_k[i] = data[i];
+    uint tid = gl_LocalInvocationID.x;
+    uint pos = pc.rows;
+    uint head_dim = pc.cols;
+    uint n_q_heads = pc.opt0;
+    uint n_kv_heads = pc.opt1;
+    float theta = pc.param0;
+
+    uint half_dim = head_dim / 2u;
+    uint total_pairs_q = n_q_heads * half_dim;
+    uint total_pairs_k = n_kv_heads * half_dim;
+
+    // gl_WorkGroupID.x == 0 -> process Q, == 1 -> process K
+    if (gl_WorkGroupID.x == 0u) {
+        for (uint p = tid; p < total_pairs_q; p += 256u) {
+            uint h = p / half_dim;
+            uint d_pair = p % half_dim;
+            float freq = 1.0 / pow(theta, float(d_pair * 2) / float(head_dim));
+            float cos_v = cos(float(pos) * freq);
+            float sin_v = sin(float(pos) * freq);
+
+            uint elem = h * head_dim + d_pair * 2u;
+            float x = data[elem];
+            float y = data[elem + 1u];
+            data[elem]     = x * cos_v - y * sin_v;
+            data[elem + 1u] = x * sin_v + y * cos_v;
+        }
+    } else {
+        for (uint p = tid; p < total_pairs_k; p += 256u) {
+            uint h = p / half_dim;
+            uint d_pair = p % half_dim;
+            float freq = 1.0 / pow(theta, float(d_pair * 2) / float(head_dim));
+            float cos_v = cos(float(pos) * freq);
+            float sin_v = sin(float(pos) * freq);
+
+            uint elem = h * head_dim + d_pair * 2u;
+            float x = data_k[elem];
+            float y = data_k[elem + 1u];
+            data_k[elem]     = x * cos_v - y * sin_v;
+            data_k[elem + 1u] = x * sin_v + y * cos_v;
+        }
+    }
 }
