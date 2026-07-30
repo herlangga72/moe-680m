@@ -1,0 +1,24 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_memory_scope_semantics : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Buf0 { float data[]; };
+layout(set = 0, binding = 1) buffer Buf1 { uint8_t  data8[]; };
+layout(set = 0, binding = 2) buffer Buf2 { uint16_t data16[]; };
+layout(set = 0, binding = 3) buffer Buf3 { float data_out[]; };
+
+#include "common.glsl"
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.rows) return;
+    data_out[i] = data[i];
+}
